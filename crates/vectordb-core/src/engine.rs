@@ -48,25 +48,22 @@ mod feature_space_tests {
     }
 
     #[test]
-    fn separates_binary_from_natural_language_and_preserves_it_on_reload() {
+    fn removes_legacy_binary_on_reload() {
         let db = VectorDBEngine::new(256);
         db.add_chunk_and_node(chunk("notes.md", "alpha topic"), None, None);
         db.add_chunk_and_node(chunk("src/main.rs", "fn beta() {}"), None, None);
         db.add_chunk_and_node(chunk("a.bin", "Binary File A"), None, Some(vec![1.0; 256]));
         db.add_chunk_and_node(chunk("b.bin", "Binary File B"), None, Some(vec![1.0; 256]));
+        db.add_chunk_and_node(chunk("song.mp3", "Audio Track: song"), None, None);
+        db.add_chunk_and_node(
+            chunk("scan.pdf", "PDF Document: scan.pdf\nSize: 42 bytes"),
+            None,
+            None,
+        );
 
-        assert_eq!(db.text_hnsw.len(), 1);
+        assert_eq!(db.text_hnsw.len(), 3);
         assert_eq!(db.code_hnsw.len(), 1);
         assert_eq!(db.binary_hnsw.len(), 2);
-        assert!(db
-            .search("alpha", 10, 0)
-            .hits
-            .iter()
-            .all(|h| !h.chunk.file_path.ends_with(".bin")));
-        assert_eq!(
-            db.search_similar_binary("a.bin", 5)[0].chunk.file_path,
-            "b.bin"
-        );
 
         let dir = std::env::temp_dir().join(format!(
             "vectordb-feature-test-{}-{}",
@@ -75,25 +72,18 @@ mod feature_space_tests {
         ));
         db.save_to_dir(&dir).unwrap();
         let reloaded = VectorDBEngine::load_from_dir(&dir, 256).unwrap();
-        assert_eq!(
-            db.text_hnsw.snapshot_bytes().unwrap(),
-            reloaded.text_hnsw.snapshot_bytes().unwrap()
-        );
+        assert_eq!(reloaded.text_hnsw.len(), 1);
         assert_eq!(
             db.code_hnsw.snapshot_bytes().unwrap(),
             reloaded.code_hnsw.snapshot_bytes().unwrap()
         );
-        assert_eq!(
-            db.binary_hnsw.snapshot_bytes().unwrap(),
-            reloaded.binary_hnsw.snapshot_bytes().unwrap()
-        );
-        assert_eq!(reloaded.binary_hnsw.len(), 2);
-        assert_eq!(
-            reloaded.search_similar_binary("a.bin", 5)[0]
-                .chunk
-                .file_path,
-            "b.bin"
-        );
+        assert_eq!(reloaded.binary_hnsw.len(), 0);
+        assert_eq!(reloaded.store.read().all_chunks().count(), 2);
+        assert!(reloaded
+            .search("Audio Track PDF Document", 10, 0)
+            .hits
+            .iter()
+            .all(|hit| matches!(hit.chunk.file_path.as_str(), "notes.md" | "src/main.rs")));
         assert!(reloaded
             .search("alpha", 10, 0)
             .hits
@@ -503,6 +493,66 @@ impl VectorDBEngine {
         self.remove_files_batch(&[file_path]);
     }
 
+    /// Drop non-text entries carried over from snapshots written before text-only indexing.
+    fn purge_legacy_non_text(&self) {
+        let store = self.store.read();
+        let graph = self.graph.read();
+        let features = self.features.read();
+        let paths: std::collections::HashSet<String> = store
+            .all_chunks()
+            .filter(|chunk| {
+                let extension = Path::new(&chunk.file_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                matches!(
+                    extension.as_str(),
+                    "mp3"
+                        | "m4a"
+                        | "aac"
+                        | "ogg"
+                        | "wav"
+                        | "flac"
+                        | "png"
+                        | "jpg"
+                        | "jpeg"
+                        | "gif"
+                        | "webp"
+                        | "svg"
+                        | "zip"
+                        | "tar"
+                        | "gz"
+                        | "7z"
+                        | "rar"
+                        | "bin"
+                        | "dat"
+                        | "exe"
+                        | "dll"
+                        | "so"
+                        | "dylib"
+                        | "wasm"
+                        | "docx"
+                        | "pptx"
+                        | "xlsx"
+                ) || matches!(
+                    graph.get_node_by_chunk(&chunk.id).map(|node| &node.kind),
+                    Some(NodeKind::AudioTrack | NodeKind::Image | NodeKind::Binary)
+                ) || matches!(
+                    features.get(&chunk.vector_id).map(|feature| feature.space),
+                    Some(FeatureSpace::BinaryFingerprint | FeatureSpace::Metadata)
+                ) || chunk.content.starts_with("PDF Document: ")
+            })
+            .map(|chunk| chunk.file_path.clone())
+            .collect();
+        drop(features);
+        drop(graph);
+        drop(store);
+        if !paths.is_empty() {
+            self.remove_files_batch(&paths.iter().map(String::as_str).collect::<Vec<_>>());
+        }
+    }
+
     /// Remove several files while rebuilding each affected vector space only once.
     pub fn remove_files_batch(&self, file_paths: &[&str]) {
         let mut affected = std::collections::HashSet::new();
@@ -669,40 +719,6 @@ impl VectorDBEngine {
             total_vectors: self.features.read().len(),
             subgraph,
         }
-    }
-
-    /// Find files with a similar byte histogram, using only the binary space.
-    pub fn search_similar_binary(&self, file_path: &str, limit: usize) -> Vec<SearchHit> {
-        let store = self.store.read();
-        let features = self.features.read();
-        let source = store.all_chunks().find_map(|chunk| {
-            if chunk.file_path != file_path {
-                return None;
-            }
-            features
-                .get(&chunk.vector_id)
-                .filter(|f| f.space == FeatureSpace::BinaryFingerprint)
-        });
-        let Some(source) = source else {
-            return Vec::new();
-        };
-        let graph = self.graph.read();
-        self.binary_hnsw
-            .search(&source.vector, limit.saturating_add(1), None)
-            .into_iter()
-            .filter(|hit| hit.id != source.vector_id && features.contains_key(&hit.id))
-            .filter_map(|hit| {
-                let chunk = store.get_by_vector(hit.id)?.clone();
-                Some(SearchHit {
-                    node: graph.get_node_by_chunk(&chunk.id).cloned(),
-                    chunk,
-                    score: hit.score,
-                    distance: hit.distance,
-                    related_nodes: Vec::new(),
-                })
-            })
-            .take(limit)
-            .collect()
     }
 
     /// Package the search results into a concise, token-efficient Markdown prompt ready for LLM Agents!
@@ -996,6 +1012,7 @@ impl VectorDBEngine {
         *engine.store.write() = store;
         *engine.bm25.write() = bm25;
         *engine.next_id.write() = next_id;
+        engine.purge_legacy_non_text();
         Ok(engine)
     }
 }

@@ -2,7 +2,7 @@
 //! Extracts semantic chunks (functions, classes, sections) and builds knowledge graph nodes/edges.
 
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -15,113 +15,41 @@ pub struct ParsedFile {
     pub chunks: Vec<Chunk>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    pub custom_vector: Option<Vec<f32>>,
 }
 
-pub struct CodeParser {
-    supported_extensions: HashSet<&'static str>,
-}
-
-impl Default for CodeParser {
-    fn default() -> Self {
-        let mut set = HashSet::new();
-        set.insert("rs");
-        set.insert("py");
-        set.insert("js");
-        set.insert("ts");
-        set.insert("jsx");
-        set.insert("tsx");
-        set.insert("go");
-        set.insert("c");
-        set.insert("cpp");
-        set.insert("h");
-        set.insert("hpp");
-        set.insert("md");
-        set.insert("txt");
-        set.insert("json");
-        set.insert("toml");
-        set.insert("yaml");
-        set.insert("yml");
-        set.insert("mp3");
-        set.insert("wav");
-        set.insert("flac");
-        set.insert("pdf");
-        set.insert("png");
-        set.insert("jpg");
-        set.insert("jpeg");
-        set.insert("bin");
-        set.insert("dat");
-        Self {
-            supported_extensions: set,
-        }
-    }
-}
+#[derive(Default)]
+pub struct CodeParser;
 
 impl CodeParser {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
     pub fn is_supported(&self, path: &Path) -> bool {
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext_lower = ext.to_lowercase();
-            if ext_lower == "lock" || ext_lower == "tmp" || ext_lower == "log" {
-                return false;
-            }
-            if self.supported_extensions.contains(ext_lower.as_str()) {
-                return true;
-            }
-        }
-        // Also support any non-hidden regular file
-        true
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        !crate::universal::UniversalFileAdapter::is_excluded_extension(&ext)
     }
 
     /// Parse a single file into semantic chunks and graph elements.
-    /// Handles Code, Text, PDF, MP3/Audio, Images, and arbitrary Binaries.
+    /// Only readable UTF-8 text/code and PDFs with extracted text are indexed.
     pub fn parse_file(&self, path: &Path, rel_path: &str) -> anyhow::Result<ParsedFile> {
+        anyhow::ensure!(self.is_supported(path), "non-text file is not supported");
         let bytes = fs::read(path)?;
         let format = crate::universal::UniversalFileAdapter::detect_format(&bytes, path);
 
         let parsed: anyhow::Result<ParsedFile> = match format {
-            crate::universal::FileCategory::Audio(_) => {
-                let (pf, custom_vec) =
-                    crate::universal::UniversalFileAdapter::parse_audio(&bytes, rel_path);
-                Ok(ParsedFile {
-                    custom_vector: custom_vec,
-                    ..pf
-                })
-            }
-            crate::universal::FileCategory::Document(ref mime) if mime.contains("pdf") => {
+            crate::universal::FileCategory::Pdf => {
                 let pf = crate::universal::UniversalFileAdapter::parse_pdf(&bytes, rel_path);
-                Ok(ParsedFile {
-                    custom_vector: None,
-                    ..pf
-                })
+                anyhow::ensure!(!pf.chunks.is_empty(), "PDF has no extractable text");
+                Ok(pf)
             }
-            crate::universal::FileCategory::Binary(desc)
-            | crate::universal::FileCategory::Archive(desc) => {
-                let (pf, vec) = crate::universal::UniversalFileAdapter::parse_binary_fingerprint(
-                    &bytes, rel_path, &desc,
-                );
-                Ok(ParsedFile {
-                    custom_vector: Some(vec),
-                    ..pf
-                })
-            }
-            crate::universal::FileCategory::Image(desc) => {
-                let (pf, vec) = crate::universal::UniversalFileAdapter::parse_binary_fingerprint(
-                    &bytes,
-                    rel_path,
-                    &format!("Image ({})", desc),
-                );
-                Ok(ParsedFile {
-                    custom_vector: Some(vec),
-                    ..pf
-                })
-            }
-            crate::universal::FileCategory::TextOrCode(_)
-            | crate::universal::FileCategory::Document(_) => {
-                let content = String::from_utf8_lossy(&bytes);
+            crate::universal::FileCategory::TextOrCode => {
+                let content = std::str::from_utf8(&bytes)?;
+                anyhow::ensure!(!content.trim().is_empty(), "empty text file");
                 let ext = path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -154,7 +82,7 @@ impl CodeParser {
                 match ext.as_str() {
                     "rs" => self.parse_rust(
                         rel_path,
-                        &content,
+                        content,
                         &file_node_id,
                         &mut chunks,
                         &mut nodes,
@@ -162,7 +90,7 @@ impl CodeParser {
                     ),
                     "py" => self.parse_python(
                         rel_path,
-                        &content,
+                        content,
                         &file_node_id,
                         &mut chunks,
                         &mut nodes,
@@ -170,7 +98,7 @@ impl CodeParser {
                     ),
                     "js" | "ts" | "jsx" | "tsx" => self.parse_javascript(
                         rel_path,
-                        &content,
+                        content,
                         &file_node_id,
                         &mut chunks,
                         &mut nodes,
@@ -178,7 +106,7 @@ impl CodeParser {
                     ),
                     "md" => self.parse_markdown(
                         rel_path,
-                        &content,
+                        content,
                         &file_node_id,
                         &mut chunks,
                         &mut nodes,
@@ -186,7 +114,7 @@ impl CodeParser {
                     ),
                     _ => self.parse_generic(
                         rel_path,
-                        &content,
+                        content,
                         &file_node_id,
                         &mut chunks,
                         &mut nodes,
@@ -199,9 +127,9 @@ impl CodeParser {
                     chunks,
                     nodes,
                     edges,
-                    custom_vector: None,
                 })
             }
+            _ => anyhow::bail!("non-text file is not supported"),
         };
         let mut parsed = parsed?;
         Self::normalize_chunk_edges(&mut parsed);
@@ -1265,6 +1193,36 @@ impl CodeParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn indexes_only_readable_text() {
+        let dir =
+            std::env::temp_dir().join(format!("vectordb-text-only-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "# Searchable notes\nActual text").unwrap();
+        std::fs::write(dir.join("photo.png"), b"\x89PNG\r\n\x1a\nimage bytes").unwrap();
+        std::fs::write(dir.join("hidden.bin.txt"), b"abc\0def").unwrap();
+        std::fs::write(dir.join("office.docx"), b"PK\x03\x04data").unwrap();
+        std::fs::write(dir.join("scan.pdf"), b"%PDF-1.4\n/image only").unwrap();
+        std::fs::write(
+            dir.join("paper.pdf"),
+            b"%PDF-1.4\n(Extracted PDF paragraph)",
+        )
+        .unwrap();
+
+        let parser = CodeParser::new();
+        let files = parser.scan_directory(&dir).unwrap();
+        let paths: HashSet<_> = files.iter().map(|file| file.file_path.as_str()).collect();
+        assert_eq!(paths, HashSet::from(["notes.md", "paper.pdf"]));
+        assert!(parser
+            .parse_file(&dir.join("photo.png"), "photo.png")
+            .is_err());
+        assert!(parser
+            .parse_file(&dir.join("scan.pdf"), "scan.pdf")
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn ambiguous_call_names_are_candidates_not_resolved_edges() {

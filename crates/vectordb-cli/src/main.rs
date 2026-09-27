@@ -65,14 +65,6 @@ enum Commands {
         format: OutputFormat,
     },
 
-    /// Find indexed files with a similar binary byte fingerprint
-    SimilarBinary {
-        /// Indexed file path, relative to the indexed directory
-        file: String,
-        #[arg(short, long, default_value_t = 5)]
-        limit: usize,
-    },
-
     /// Evaluate BM25, dense, and hybrid retrieval against labeled JSON queries
     Benchmark { fixture: PathBuf },
 
@@ -188,17 +180,6 @@ async fn main() -> anyhow::Result<()> {
             expand_graph,
             format,
         } => handle_search(&cli.db_dir, &query, limit, expand_graph, format),
-        Commands::SimilarBinary { file, limit } => {
-            let engine = load_or_create_engine(&cli.db_dir)?;
-            let hits = engine.search_similar_binary(&file, limit);
-            if hits.is_empty() {
-                println!("No indexed binary matches for {file}. Reindex if this database predates feature spaces.");
-            }
-            for hit in hits {
-                println!("{:.4}\t{}", hit.score, hit.chunk.file_path);
-            }
-            Ok(())
-        }
         Commands::Benchmark { fixture } => benchmark::run(&fixture),
         Commands::AnnBenchmark {
             vectors,
@@ -248,12 +229,14 @@ fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
 
     let parser = CodeParser::new();
     let parsed_files = parser.scan_directory(target_dir)?;
+    let engine = load_or_create_engine(db_dir)?;
 
     if parsed_files.is_empty() {
         println!(
             "{}",
             "⚠️  No supported source files found in target directory.".yellow()
         );
+        engine.save_to_dir(db_dir)?;
         return Ok(());
     }
 
@@ -264,7 +247,6 @@ fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
             .progress_chars("#>-"),
     );
 
-    let engine = load_or_create_engine(db_dir)?;
     engine.remove_files_batch(
         &parsed_files
             .iter()
@@ -295,7 +277,7 @@ fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
             if node.is_some() {
                 total_nodes += 1;
             }
-            engine.add_chunk_and_node(chunk, node, file.custom_vector.clone());
+            engine.add_chunk_and_node(chunk, node, None);
             total_chunks += 1;
         }
 
@@ -997,7 +979,12 @@ async fn handle_watch(db_dir: &Path, target_dir: &Path, debounce_ms: u64) -> any
                     let relative = path.strip_prefix(&root)?.to_string_lossy().to_string();
                     match parser.parse_file(&path, &relative) {
                         Ok(file) => parsed.push((path, stamp, file)),
-                        Err(error) => eprintln!("Could not parse {relative}: {error}"),
+                        Err(error) => {
+                            eprintln!("Could not parse {relative}: {error}");
+                            if file_snapshots.contains_key(&path) {
+                                deleted.push(path);
+                            }
+                        }
                     }
                 }
             } else if file_snapshots.contains_key(&path) {
@@ -1032,7 +1019,7 @@ async fn handle_watch(db_dir: &Path, target_dir: &Path, debounce_ms: u64) -> any
             let chunks = file.chunks.len();
             for chunk in file.chunks {
                 let node = node_by_chunk.remove(&chunk.id);
-                engine.add_chunk_and_node(chunk, node, file.custom_vector.clone());
+                engine.add_chunk_and_node(chunk, node, None);
             }
             for edge in file.edges {
                 engine.add_graph_edge(edge.source, edge.target, edge.kind, edge.weight);
