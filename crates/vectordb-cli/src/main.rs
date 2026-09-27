@@ -151,7 +151,7 @@ enum Commands {
         task: String,
     },
 
-    /// Watch workspace files and incrementally re-index on change in ~5ms
+    /// Watch filesystem events and re-index changed files in batches
     Watch {
         /// Directory path to watch
         #[arg(default_value = ".")]

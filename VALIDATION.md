@@ -12,6 +12,7 @@ This file records what the current tests actually prove. It is not a release gat
 | Snapshot writing | Saving now writes and syncs a temporary file before an atomic rename to `metadata.bin`; failed writes leave the previous snapshot in place. | Kill-9 fault injection, concurrent writer consistency, and platform-specific crash recovery verification. |
 | Cold start | VDB3 saves HNSW topology. VDB2 loading and upgrade are tested. `cold-benchmark` measures build/save/load/query and full CLI first search at 1k/10k/100k vectors. | Warm filesystem cache only, one host, synthetic corpus, five runs per size. No 1M result or old-format apples-to-apples baseline. |
 | Watcher | Native filesystem events replace periodic whole-tree polling. Initial and rescan-event traversal remain. A live smoke test passed on macOS. | Idle CPU/wakeups, burst event loss, 10k+ file trees, and save/write amplification are unmeasured. |
+| Agent integration | A project skill is installed for Codex, Antigravity, OpenCode, and Claude Code. Installer tests check idempotence and preservation of existing Claude settings; a prompt hook retrieves a path from a real indexed fixture. | Native skill discovery and hook execution inside all four agent products have not been tested. Codex and Claude prompt hooks are optional; Antigravity and OpenCode have skill integration only. |
 
 Run the checks with:
 
