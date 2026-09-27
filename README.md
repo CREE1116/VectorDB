@@ -8,7 +8,8 @@
 - 자연어 검색은 BM25와 텍스트/코드별 HNSW 결과를 순위 기반 RRF로 결합합니다. 기본 벡터 생성기는 토큰·문자 n-gram 해시이며 신경망 의미 임베딩이 아닙니다.
 - 바이너리 바이트 fingerprint는 별도 인덱스에 저장하고, 인덱싱된 파일끼리만 유사도를 비교합니다. 같은 256차원이라는 이유로 자연어 벡터와 cosine 점수를 섞지 않습니다.
 - 코드의 `Contains`, `Defines`, `NextChunk`와 Git 이력의 `CoChangedWith` 관계를 기록합니다. 이름 패턴으로 찾은 호출은 `CallsCandidate`로 표시하며, 확정된 호출로 사용하지 않습니다.
-- 파일 감시로 변경 파일을 다시 인덱싱할 수 있습니다. 삭제가 일어나면 HNSW를 재구축하므로 이전의 밀리초 단위 증분 성능 주장은 현재 코드에 적용되지 않습니다.
+- 파일 감시는 파일 시스템 이벤트를 묶어 변경 경로만 다시 인덱싱합니다. 삭제가 일어나면 영향을 받은 벡터 공간의 HNSW를 재구축하므로 이전의 밀리초 단위 증분 성능 주장은 현재 코드에 적용되지 않습니다.
+- 저장 파일에는 HNSW 그래프도 포함됩니다. 이전 VDB2 스냅샷은 읽을 수 있으며 다음 저장 시 VDB3로 갱신됩니다.
 
 ## 실행
 
@@ -36,9 +37,10 @@ cargo test
 cargo test incremental_matches_fresh_after_ten_thousand_mutations -- --ignored
 cargo run --release -p vectordb-cli -- benchmark benchmarks/retrieval-smoke.json
 cargo run --release -p vectordb-cli -- ann-benchmark --vectors 10000 --queries 50 --ef-search 256
+cargo run --release -p vectordb-cli -- cold-benchmark --vectors 100000 --iterations 5
 ```
 
-`benchmark`는 라벨된 JSON fixture에서 BM25, dense, hybrid의 Recall@5/10, MRR, nDCG@10, Hit@1을 출력합니다. 포함된 fixture는 기능 점검용이며 규모가 작습니다. `ann-benchmark`는 같은 벡터에 대해 HNSW와 전수 SIMD 검색을 비교합니다. 반복 측정과 더 다양한 분포가 필요한 결과는 [REPORT.md](REPORT.md)에 구분해 적었습니다.
+`benchmark`는 라벨된 JSON fixture에서 BM25, dense, hybrid의 Recall@5/10, MRR, nDCG@10, Hit@1을 출력합니다. 포함된 fixture는 기능 점검용이며 규모가 작습니다. `ann-benchmark`는 같은 벡터에 대해 HNSW와 전수 SIMD 검색을 비교합니다. `cold-benchmark`는 스냅샷 로드와 별도 CLI 프로세스의 첫 검색을 반복 측정합니다. 결과와 측정 한계는 [REPORT.md](REPORT.md)에 적었습니다.
 
 ## 프로젝트 구조
 

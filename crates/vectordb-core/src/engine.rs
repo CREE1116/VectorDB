@@ -15,7 +15,8 @@ use crate::hnsw::{HnswConfig, HnswIndexThreadSafe};
 use crate::store::{Chunk, ChunkStore};
 use crate::types::{Feature, FeatureSpace, NodeId, VectorId};
 
-const DUMP_MAGIC: &[u8; 4] = b"VDB2";
+const DUMP_MAGIC_V2: &[u8; 4] = b"VDB2";
+const DUMP_MAGIC_V3: &[u8; 4] = b"VDB3";
 static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +75,18 @@ mod feature_space_tests {
         ));
         db.save_to_dir(&dir).unwrap();
         let reloaded = VectorDBEngine::load_from_dir(&dir, 256).unwrap();
+        assert_eq!(
+            db.text_hnsw.snapshot_bytes().unwrap(),
+            reloaded.text_hnsw.snapshot_bytes().unwrap()
+        );
+        assert_eq!(
+            db.code_hnsw.snapshot_bytes().unwrap(),
+            reloaded.code_hnsw.snapshot_bytes().unwrap()
+        );
+        assert_eq!(
+            db.binary_hnsw.snapshot_bytes().unwrap(),
+            reloaded.binary_hnsw.snapshot_bytes().unwrap()
+        );
         assert_eq!(reloaded.binary_hnsw.len(), 2);
         assert_eq!(
             reloaded.search_similar_binary("a.bin", 5)[0]
@@ -87,6 +100,63 @@ mod feature_space_tests {
             .iter()
             .all(|h| !h.chunk.file_path.ends_with(".bin")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn loads_v2_and_upgrades_on_next_save() {
+        let db = VectorDBEngine::new(256);
+        db.add_chunk_and_node(chunk("notes.md", "legacy snapshot"), None, None);
+        let dir = std::env::temp_dir().join(format!("vectordb-v2-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dump = EngineDumpV2 {
+            graph: db.graph.read().clone(),
+            store: db.store.read().clone(),
+            bm25: db.bm25.read().clone(),
+            next_id: *db.next_id.read(),
+            features: db.features.read().values().cloned().collect(),
+        };
+        let mut file = File::create(dir.join("metadata.bin")).unwrap();
+        file.write_all(DUMP_MAGIC_V2).unwrap();
+        bincode::serialize_into(&mut file, &dump).unwrap();
+        drop(file);
+        let upgraded = VectorDBEngine::load_from_dir(&dir, 256).unwrap();
+        assert_eq!(
+            upgraded.search("legacy", 1, 0).hits[0].chunk.file_path,
+            "notes.md"
+        );
+        upgraded.save_to_dir(&dir).unwrap();
+        assert_eq!(
+            &std::fs::read(dir.join("metadata.bin")).unwrap()[..4],
+            DUMP_MAGIC_V3
+        );
+        assert_eq!(
+            VectorDBEngine::load_from_dir(&dir, 256).unwrap().stats(),
+            upgraded.stats()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_removal_keeps_unaffected_space_and_live_results() {
+        let db = VectorDBEngine::new(256);
+        for (path, content) in [
+            ("a.md", "alpha document"),
+            ("b.md", "beta document"),
+            ("c.md", "gamma document"),
+            ("src/lib.rs", "fn durable_code() {}"),
+        ] {
+            add_file(&db, path, content);
+        }
+        let code_before = db.code_hnsw.snapshot_bytes().unwrap();
+        db.remove_files_batch(&["a.md", "b.md", "a.md"]);
+        assert_eq!(db.text_hnsw.len(), 1);
+        assert_eq!(db.code_hnsw.snapshot_bytes().unwrap(), code_before);
+        assert_eq!(db.search("gamma", 1, 0).hits[0].chunk.file_path, "c.md");
+        assert!(db
+            .store
+            .read()
+            .all_chunks()
+            .all(|chunk| chunk.file_path != "a.md" && chunk.file_path != "b.md"));
     }
 
     fn add_file(db: &VectorDBEngine, path: &str, content: &str) {
@@ -258,6 +328,18 @@ struct EngineDumpV2 {
     features: Vec<Feature>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct EngineDumpV3 {
+    graph: KnowledgeGraph,
+    store: ChunkStore,
+    bm25: Bm25Index,
+    next_id: u64,
+    features: Vec<Feature>,
+    text_hnsw: Vec<u8>,
+    code_hnsw: Vec<u8>,
+    binary_hnsw: Vec<u8>,
+}
+
 pub struct VectorDBEngine {
     embedder: Arc<dyn EmbeddingProvider>,
     text_hnsw: Arc<HnswIndexThreadSafe>,
@@ -418,20 +500,40 @@ impl VectorDBEngine {
 
     /// Remove all chunks, BM25 postings, and graph nodes for a given file path.
     pub fn remove_file(&self, file_path: &str) {
-        let removed_chunks = self.store.write().remove_by_file(file_path);
-        let mut bm25_guard = self.bm25.write();
-        for chunk in &removed_chunks {
-            bm25_guard.remove_document(&chunk.id);
-            self.features.write().remove(&chunk.vector_id);
+        self.remove_files_batch(&[file_path]);
+    }
+
+    /// Remove several files while rebuilding each affected vector space only once.
+    pub fn remove_files_batch(&self, file_paths: &[&str]) {
+        let mut affected = std::collections::HashSet::new();
+        let unique_paths: std::collections::HashSet<_> = file_paths.iter().copied().collect();
+        let removed_chunks = {
+            let mut store = self.store.write();
+            store.remove_by_files(&unique_paths)
+        };
+        {
+            let mut bm25 = self.bm25.write();
+            for chunk in &removed_chunks {
+                bm25.remove_document(&chunk.id);
+            }
         }
-        drop(bm25_guard);
-        self.graph.write().remove_file_nodes(file_path);
-        if !removed_chunks.is_empty() {
-            self.rebuild_vector_indices();
+        {
+            let mut features = self.features.write();
+            for chunk in &removed_chunks {
+                if let Some(feature) = features.remove(&chunk.vector_id) {
+                    affected.insert(feature.space);
+                }
+            }
+        }
+        for file_path in unique_paths {
+            self.graph.write().remove_file_nodes(file_path);
+        }
+        if !affected.is_empty() {
+            self.rebuild_vector_indices(&affected);
         }
     }
 
-    fn rebuild_vector_indices(&self) {
+    fn rebuild_vector_indices(&self, affected: &std::collections::HashSet<FeatureSpace>) {
         let features = self.features.read();
         let vectors_for = |space| {
             let mut vectors: Vec<_> = features
@@ -442,10 +544,16 @@ impl VectorDBEngine {
             vectors.sort_by_key(|(id, _)| *id);
             vectors
         };
-        self.text_hnsw.rebuild(&vectors_for(FeatureSpace::Text));
-        self.code_hnsw.rebuild(&vectors_for(FeatureSpace::Code));
-        self.binary_hnsw
-            .rebuild(&vectors_for(FeatureSpace::BinaryFingerprint));
+        if affected.contains(&FeatureSpace::Text) {
+            self.text_hnsw.rebuild(&vectors_for(FeatureSpace::Text));
+        }
+        if affected.contains(&FeatureSpace::Code) {
+            self.code_hnsw.rebuild(&vectors_for(FeatureSpace::Code));
+        }
+        if affected.contains(&FeatureSpace::BinaryFingerprint) {
+            self.binary_hnsw
+                .rebuild(&vectors_for(FeatureSpace::BinaryFingerprint));
+        }
     }
 
     /// Hybrid search: Combines Dense HNSW Vector similarity with Sparse BM25 via Reciprocal Rank Fusion (RRF)
@@ -708,12 +816,15 @@ impl VectorDBEngine {
             sequence
         ));
 
-        let dump = EngineDumpV2 {
+        let dump = EngineDumpV3 {
             graph: self.graph.read().clone(),
             store: self.store.read().clone(),
             bm25: self.bm25.read().clone(),
             next_id: *self.next_id.read(),
             features: self.features.read().values().cloned().collect(),
+            text_hnsw: self.text_hnsw.snapshot_bytes()?,
+            code_hnsw: self.code_hnsw.snapshot_bytes()?,
+            binary_hnsw: self.binary_hnsw.snapshot_bytes()?,
         };
 
         let result = (|| -> anyhow::Result<()> {
@@ -722,7 +833,7 @@ impl VectorDBEngine {
                 .create_new(true)
                 .open(&temp_path)?;
             let mut writer = BufWriter::new(file);
-            writer.write_all(DUMP_MAGIC)?;
+            writer.write_all(DUMP_MAGIC_V3)?;
             bincode::serialize_into(&mut writer, &dump)?;
             writer.flush()?;
             writer.into_inner()?.sync_all()?;
@@ -748,7 +859,17 @@ impl VectorDBEngine {
         let mut reader = BufReader::new(file);
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
-        let (mut graph, store, bm25, next_id, features) = if &magic == DUMP_MAGIC {
+        let (mut graph, store, bm25, next_id, features, index_bytes) = if &magic == DUMP_MAGIC_V3 {
+            let dump: EngineDumpV3 = bincode::deserialize_from(reader)?;
+            (
+                dump.graph,
+                dump.store,
+                dump.bm25,
+                dump.next_id,
+                dump.features,
+                Some((dump.text_hnsw, dump.code_hnsw, dump.binary_hnsw)),
+            )
+        } else if &magic == DUMP_MAGIC_V2 {
             let dump: EngineDumpV2 = bincode::deserialize_from(reader)?;
             (
                 dump.graph,
@@ -756,6 +877,7 @@ impl VectorDBEngine {
                 dump.bm25,
                 dump.next_id,
                 dump.features,
+                None,
             )
         } else {
             // v0.1 did not persist custom vectors. Recover text/code vectors;
@@ -793,27 +915,83 @@ impl VectorDBEngine {
                     })
                 })
                 .collect();
-            (dump.graph, dump.store, dump.bm25, dump.next_id, features)
+            (
+                dump.graph,
+                dump.store,
+                dump.bm25,
+                dump.next_id,
+                features,
+                None,
+            )
         };
 
         graph.prune_dangling_edges();
-        let engine = Self::new(dim);
+        let mut engine = Self::new(dim);
+        let has_index_snapshot = index_bytes.is_some();
+        if let Some((text, code, binary)) = index_bytes {
+            engine.text_hnsw = Arc::new(HnswIndexThreadSafe::from_snapshot_bytes(&text, dim)?);
+            engine.code_hnsw = Arc::new(HnswIndexThreadSafe::from_snapshot_bytes(&code, dim)?);
+            engine.binary_hnsw = Arc::new(HnswIndexThreadSafe::from_snapshot_bytes(&binary, 256)?);
+        }
         for feature in features {
             match feature.space {
-                FeatureSpace::Text if feature.vector.len() == dim => engine
-                    .text_hnsw
-                    .insert(feature.vector_id, feature.vector.clone()),
-                FeatureSpace::Code if feature.vector.len() == dim => engine
-                    .code_hnsw
-                    .insert(feature.vector_id, feature.vector.clone()),
-                FeatureSpace::BinaryFingerprint if feature.vector.len() == 256 => engine
-                    .binary_hnsw
-                    .insert(feature.vector_id, feature.vector.clone()),
+                FeatureSpace::Text if feature.vector.len() == dim => {
+                    if !has_index_snapshot {
+                        engine
+                            .text_hnsw
+                            .insert(feature.vector_id, feature.vector.clone());
+                    } else {
+                        anyhow::ensure!(
+                            engine.text_hnsw.contains_vector(feature.vector_id),
+                            "text HNSW missing feature"
+                        );
+                    }
+                }
+                FeatureSpace::Code if feature.vector.len() == dim => {
+                    if !has_index_snapshot {
+                        engine
+                            .code_hnsw
+                            .insert(feature.vector_id, feature.vector.clone());
+                    } else {
+                        anyhow::ensure!(
+                            engine.code_hnsw.contains_vector(feature.vector_id),
+                            "code HNSW missing feature"
+                        );
+                    }
+                }
+                FeatureSpace::BinaryFingerprint if feature.vector.len() == 256 => {
+                    if !has_index_snapshot {
+                        engine
+                            .binary_hnsw
+                            .insert(feature.vector_id, feature.vector.clone());
+                    } else {
+                        anyhow::ensure!(
+                            engine.binary_hnsw.contains_vector(feature.vector_id),
+                            "binary HNSW missing feature"
+                        );
+                    }
+                }
                 FeatureSpace::Metadata => continue,
                 _ => anyhow::bail!("saved feature dimension does not match its space"),
             }
             engine.features.write().insert(feature.vector_id, feature);
         }
+        let features_guard = engine.features.read();
+        for (space, count) in [
+            (FeatureSpace::Text, engine.text_hnsw.len()),
+            (FeatureSpace::Code, engine.code_hnsw.len()),
+            (FeatureSpace::BinaryFingerprint, engine.binary_hnsw.len()),
+        ] {
+            anyhow::ensure!(
+                features_guard
+                    .values()
+                    .filter(|feature| feature.space == space)
+                    .count()
+                    == count,
+                "HNSW feature count mismatch"
+            );
+        }
+        drop(features_guard);
         *engine.graph.write() = graph;
         *engine.store.write() = store;
         *engine.bm25.write() = bm25;
