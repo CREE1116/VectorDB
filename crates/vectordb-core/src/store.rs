@@ -58,10 +58,14 @@ impl ChunkStore {
     }
 
     pub fn remove_by_file(&mut self, file_path: &str) -> Vec<Chunk> {
+        self.remove_by_files(&[file_path].into_iter().collect())
+    }
+
+    pub fn remove_by_files(&mut self, paths: &std::collections::HashSet<&str>) -> Vec<Chunk> {
         let ids: Vec<ChunkId> = self
             .chunks
             .values()
-            .filter(|c| c.file_path == file_path)
+            .filter(|c| paths.contains(c.file_path.as_str()))
             .map(|c| c.id.clone())
             .collect();
 

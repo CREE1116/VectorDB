@@ -149,6 +149,29 @@ impl HnswIndexThreadSafe {
     pub fn get_vector(&self, id: VectorId) -> Option<Vec<f32>> {
         self.inner.read().get_vector(id).cloned()
     }
+
+    pub fn contains_vector(&self, id: VectorId) -> bool {
+        self.inner.read().get_vector(id).is_some()
+    }
+
+    pub fn snapshot_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(bincode::serialize(&*self.inner.read())?)
+    }
+
+    pub fn from_snapshot_bytes(bytes: &[u8], expected_dim: usize) -> anyhow::Result<Self> {
+        let index: HnswIndex = bincode::deserialize(bytes)?;
+        anyhow::ensure!(
+            index.dim == expected_dim,
+            "HNSW snapshot dimension mismatch"
+        );
+        anyhow::ensure!(
+            index.count <= index.nodes.len() && index.count <= index.vectors.len(),
+            "invalid HNSW snapshot count"
+        );
+        Ok(Self {
+            inner: RwLock::new(index),
+        })
+    }
 }
 
 impl HnswIndex {

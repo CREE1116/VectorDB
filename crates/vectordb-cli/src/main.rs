@@ -4,6 +4,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
+use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use vectordb_server::VectorDBServer;
 
 mod ann_benchmark;
 mod benchmark;
+mod cold_benchmark;
 
 const DEFAULT_DB_DIR: &str = ".vectordb";
 const EMBED_DIM: usize = 256;
@@ -92,6 +94,14 @@ enum Commands {
         ef_construction: usize,
     },
 
+    /// Measure snapshot build, save, load, and first-query time
+    ColdBenchmark {
+        #[arg(long, default_value_t = 1_000)]
+        vectors: usize,
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+    },
+
     /// Fetch and display a specific code chunk by ID
     Chunk {
         /// Chunk ID (e.g. chunk:src/main.rs:10:45)
@@ -141,7 +151,7 @@ enum Commands {
         task: String,
     },
 
-    /// Watch workspace files and incrementally re-index on change in ~5ms
+    /// Watch filesystem events and re-index changed files in batches
     Watch {
         /// Directory path to watch
         #[arg(default_value = ".")]
@@ -207,6 +217,10 @@ async fn main() -> anyhow::Result<()> {
             m,
             ef_construction,
         ),
+        Commands::ColdBenchmark {
+            vectors,
+            iterations,
+        } => cold_benchmark::run(vectors, iterations),
         Commands::Chunk { id } => handle_chunk(&cli.db_dir, &id),
         Commands::Graph { node_id, hops } => handle_graph(&cli.db_dir, &node_id, hops),
         Commands::Serve { port, open } => handle_serve(&cli.db_dir, port, open).await,
@@ -251,6 +265,12 @@ fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
     );
 
     let engine = load_or_create_engine(db_dir)?;
+    engine.remove_files_batch(
+        &parsed_files
+            .iter()
+            .map(|file| file.file_path.as_str())
+            .collect::<Vec<_>>(),
+    );
 
     let mut total_chunks = 0;
     let mut total_nodes = 0;
@@ -259,7 +279,6 @@ fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
 
     for file in parsed_files {
         pb.set_message(file.file_path.clone());
-        engine.remove_file(&file.file_path);
 
         let mut node_by_chunk = std::collections::HashMap::new();
         for node in file.nodes {
@@ -854,180 +873,185 @@ fn handle_co_change(target_file: &str, max_commits: usize) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn handle_watch(db_dir: &Path, target_dir: &Path, debounce_ms: u64) -> anyhow::Result<()> {
-    println!(
-        "{}",
-        "═══════════════════════════════════════════════════════════════".dimmed()
-    );
-    println!(
-        "{}",
-        "👁️  VectorDB Real-time Incremental Watcher Active"
-            .bold()
-            .cyan()
-    );
-    println!(
-        "   📁 Watching directory: {}",
-        target_dir
-            .canonicalize()
-            .unwrap_or(target_dir.to_path_buf())
-            .display()
-            .to_string()
-            .yellow()
-    );
-    println!(
-        "   💾 Database location:   {}",
-        db_dir.display().to_string().cyan()
-    );
-    println!("   ⚡ Debounce:           {}ms", debounce_ms);
-    println!("   Press Ctrl+C to stop watching.");
-    println!(
-        "{}",
-        "═══════════════════════════════════════════════════════════════\n".dimmed()
-    );
+type FileStamp = (std::time::SystemTime, u64);
 
-    let parser = CodeParser::new();
-    let engine = load_or_create_engine(db_dir)?;
-
-    let scan_files = |dir: &Path,
-                      parser: &CodeParser|
-     -> std::collections::HashMap<PathBuf, (std::time::SystemTime, u64)> {
-        let mut map = std::collections::HashMap::new();
-        for entry in walkdir::WalkDir::new(dir)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                if e.depth() > 0 && name.starts_with('.') && name != ".vectordb" {
-                    return false;
-                }
-                if name == "target"
-                    || name == "node_modules"
-                    || name == ".git"
-                    || name == ".vectordb"
-                {
-                    return false;
-                }
-                true
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() && parser.is_supported(path) {
-                if let Ok(meta) = path.metadata() {
-                    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    map.insert(path.to_path_buf(), (mtime, meta.len()));
-                }
-            }
-        }
-        map
+fn watch_path_allowed(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
     };
+    !relative.components().any(|part| {
+        let name = part.as_os_str().to_string_lossy();
+        name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules")
+    })
+}
 
-    let mut file_snapshots = scan_files(target_dir, &parser);
-    println!(
-        "👀 Tracking {} files for real-time changes...\n",
-        file_snapshots.len().to_string().bold().green()
-    );
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(debounce_ms));
-
-    loop {
-        interval.tick().await;
-
-        let current_snapshots = scan_files(target_dir, &parser);
-        let mut modified_or_created = Vec::new();
-        let mut deleted = Vec::new();
-
-        for (path, (curr_mtime, curr_len)) in &current_snapshots {
-            match file_snapshots.get(path) {
-                Some((prev_mtime, prev_len)) => {
-                    if curr_mtime != prev_mtime || curr_len != prev_len {
-                        modified_or_created.push(path.clone());
-                    }
-                }
-                None => {
-                    modified_or_created.push(path.clone());
-                }
-            }
-        }
-
-        for path in file_snapshots.keys() {
-            if !current_snapshots.contains_key(path) {
-                deleted.push(path.clone());
-            }
-        }
-
-        if !modified_or_created.is_empty() || !deleted.is_empty() {
-            let start = std::time::Instant::now();
-
-            for path in &modified_or_created {
-                let rel_path = path
-                    .strip_prefix(target_dir)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-                engine.remove_file(&rel_path);
-
-                if let Ok(parsed) = parser.parse_file(path, &rel_path) {
-                    let mut updated_nodes = 0;
-                    let mut updated_chunks = 0;
-
-                    let mut node_by_chunk = std::collections::HashMap::new();
-                    for node in parsed.nodes {
-                        if let Some(ref cid) = node.chunk_id {
-                            node_by_chunk.insert(cid.clone(), node);
-                        } else {
-                            engine.add_graph_node(node);
-                            updated_nodes += 1;
-                        }
-                    }
-
-                    for chunk in parsed.chunks {
-                        let node = node_by_chunk.remove(&chunk.id);
-                        if node.is_some() {
-                            updated_nodes += 1;
-                        }
-                        engine.add_chunk_and_node(chunk, node, parsed.custom_vector.clone());
-                        updated_chunks += 1;
-                    }
-
-                    for edge in parsed.edges {
-                        engine.add_graph_edge(edge.source, edge.target, edge.kind, edge.weight);
-                    }
-
-                    let dur_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let timestamp = simple_time();
-                    println!(
-                        "⚡ [{}] {} {} ({} chunks, {} symbols in {:.1}ms)",
-                        timestamp.dimmed(),
-                        "Re-indexed:".bold().green(),
-                        rel_path.cyan(),
-                        updated_chunks,
-                        updated_nodes,
-                        dur_ms
-                    );
-                }
-            }
-
-            for path in &deleted {
-                let rel_path = path
-                    .strip_prefix(target_dir)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-                engine.remove_file(&rel_path);
-                let timestamp = simple_time();
-                println!(
-                    "🗑️  [{}] {} {}",
-                    timestamp.dimmed(),
-                    "Removed:".bold().red(),
-                    rel_path.cyan()
+fn scan_watch_path(
+    root: &Path,
+    path: &Path,
+    parser: &CodeParser,
+) -> std::collections::HashMap<PathBuf, FileStamp> {
+    let mut files = std::collections::HashMap::new();
+    if !watch_path_allowed(root, path) {
+        return files;
+    }
+    for entry in walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|entry| watch_path_allowed(root, entry.path()))
+        .filter_map(Result::ok)
+    {
+        let file = entry.path();
+        if file.is_file() && parser.is_supported(file) {
+            if let Ok(meta) = file.metadata() {
+                files.insert(
+                    file.to_path_buf(),
+                    (
+                        meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        meta.len(),
+                    ),
                 );
             }
-
-            if let Err(e) = engine.save_to_dir(db_dir) {
-                eprintln!("Failed to save database: {}", e);
-            }
-
-            file_snapshots = current_snapshots;
         }
     }
+    files
+}
+
+async fn handle_watch(db_dir: &Path, target_dir: &Path, debounce_ms: u64) -> anyhow::Result<()> {
+    let root = target_dir.canonicalize()?;
+    println!(
+        "👁️  Watching {} ({} ms debounce). Press Ctrl+C to stop.",
+        root.display(),
+        debounce_ms
+    );
+    let parser = CodeParser::new();
+    let engine = load_or_create_engine(db_dir)?;
+    let mut file_snapshots = scan_watch_path(&root, &root, &parser);
+    println!("👀 Tracking {} files", file_snapshots.len());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = tx.send(event);
+    })?;
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+
+    while let Some(first) = rx.recv().await {
+        // Group bursts from editors, file moves, and build tools into one update.
+        let mut events = vec![first];
+        tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let mut rescan = false;
+        let mut paths = std::collections::HashSet::new();
+        let mut direct_files = std::collections::HashSet::new();
+        for event in events {
+            match event {
+                Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
+                    if event.need_rescan() || event.paths.is_empty() {
+                        rescan = true;
+                    }
+                    for path in event.paths {
+                        let absolute = if path.is_absolute() {
+                            path
+                        } else {
+                            root.join(path)
+                        };
+                        if watch_path_allowed(&root, &absolute) {
+                            if absolute.is_file() {
+                                direct_files.insert(absolute.clone());
+                            }
+                            paths.insert(absolute);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Watcher event error: {error}; rescanning");
+                    rescan = true;
+                }
+                _ => {}
+            }
+        }
+        if rescan {
+            paths.clear();
+            paths.insert(root.clone());
+        }
+        if paths.is_empty() {
+            continue;
+        }
+
+        let mut observed = std::collections::HashMap::new();
+        let mut candidates = std::collections::HashSet::new();
+        for path in &paths {
+            for old in file_snapshots.keys().filter(|old| old.starts_with(path)) {
+                candidates.insert(old.clone());
+            }
+            let found = scan_watch_path(&root, path, &parser);
+            candidates.extend(found.keys().cloned());
+            observed.extend(found);
+        }
+        let mut parsed = Vec::new();
+        let mut deleted = Vec::new();
+        for path in candidates {
+            if let Some(&stamp) = observed.get(&path) {
+                if direct_files.contains(&path) || file_snapshots.get(&path) != Some(&stamp) {
+                    let relative = path.strip_prefix(&root)?.to_string_lossy().to_string();
+                    match parser.parse_file(&path, &relative) {
+                        Ok(file) => parsed.push((path, stamp, file)),
+                        Err(error) => eprintln!("Could not parse {relative}: {error}"),
+                    }
+                }
+            } else if file_snapshots.contains_key(&path) {
+                deleted.push(path);
+            }
+        }
+        if parsed.is_empty() && deleted.is_empty() {
+            continue;
+        }
+        let removal_paths: Vec<String> = parsed
+            .iter()
+            .map(|(_, _, file)| file.file_path.clone())
+            .chain(deleted.iter().map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string()
+            }))
+            .collect();
+        engine.remove_files_batch(&removal_paths.iter().map(String::as_str).collect::<Vec<_>>());
+
+        for (path, stamp, file) in parsed {
+            let relative = file.file_path.clone();
+            let mut node_by_chunk = std::collections::HashMap::new();
+            for node in file.nodes {
+                if let Some(ref id) = node.chunk_id {
+                    node_by_chunk.insert(id.clone(), node);
+                } else {
+                    engine.add_graph_node(node);
+                }
+            }
+            let chunks = file.chunks.len();
+            for chunk in file.chunks {
+                let node = node_by_chunk.remove(&chunk.id);
+                engine.add_chunk_and_node(chunk, node, file.custom_vector.clone());
+            }
+            for edge in file.edges {
+                engine.add_graph_edge(edge.source, edge.target, edge.kind, edge.weight);
+            }
+            file_snapshots.insert(path, stamp);
+            println!(
+                "⚡ [{}] Re-indexed: {} ({} chunks)",
+                simple_time(),
+                relative,
+                chunks
+            );
+        }
+        for path in deleted {
+            file_snapshots.remove(&path);
+            println!("🗑️  [{}] Removed: {}", simple_time(), path.display());
+        }
+        if let Err(error) = engine.save_to_dir(db_dir) {
+            eprintln!("Failed to save database: {error}");
+        }
+    }
+    anyhow::bail!("filesystem watcher stopped")
 }

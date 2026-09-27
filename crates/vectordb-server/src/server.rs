@@ -168,8 +168,14 @@ async fn index_directory(
     let mut edges_count = 0;
     let mut pending_edges = Vec::new();
 
+    state.engine.remove_files_batch(
+        &parsed_files
+            .iter()
+            .map(|file| file.file_path.as_str())
+            .collect::<Vec<_>>(),
+    );
+
     for file in parsed_files {
-        state.engine.remove_file(&file.file_path);
         // Collect node by chunk_id
         let mut node_by_chunk: std::collections::HashMap<String, vectordb_core::Node> =
             std::collections::HashMap::new();

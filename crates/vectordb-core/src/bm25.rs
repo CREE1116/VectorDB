@@ -135,24 +135,23 @@ impl Bm25Index {
                 .push((id.clone(), tf));
         }
 
+        let previous_total_tokens = self.avg_doc_length * self.total_docs as f32;
         self.doc_lengths.insert(id, doc_len);
         self.total_docs += 1;
-
-        // Recalculate average document length
-        let total_tokens: f32 = self.doc_lengths.values().sum();
-        self.avg_doc_length = total_tokens / (self.total_docs as f32);
+        self.avg_doc_length = (previous_total_tokens + doc_len) / self.total_docs as f32;
     }
 
     /// Remove a document by ID (for incremental updates)
     pub fn remove_document(&mut self, id: &str) {
-        if self.doc_lengths.remove(id).is_some() {
+        if let Some(doc_len) = self.doc_lengths.remove(id) {
+            let previous_total_tokens = self.avg_doc_length * self.total_docs as f32;
             self.total_docs = self.total_docs.saturating_sub(1);
             for postings in self.inverted_index.values_mut() {
                 postings.retain(|(doc_id, _)| doc_id != id);
             }
             if self.total_docs > 0 {
-                let total_tokens: f32 = self.doc_lengths.values().sum();
-                self.avg_doc_length = total_tokens / (self.total_docs as f32);
+                self.avg_doc_length =
+                    (previous_total_tokens - doc_len).max(0.0) / self.total_docs as f32;
             } else {
                 self.avg_doc_length = 0.0;
             }
