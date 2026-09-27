@@ -1,0 +1,5 @@
+/target/
+/.vectordb/
+/.vectordb*/
+**/*.rs.bk
+.DS_Store

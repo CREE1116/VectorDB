@@ -1,0 +1,32 @@
+{
+  "documents": [
+    {"id":"simd-cosine","path":"src/simd.rs","content":"pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 { dot_product(a,b) / norms(a,b) }"},
+    {"id":"simd-dot","path":"src/dot.rs","content":"pub fn dot_product(a: &[f32], b: &[f32]) -> f32 { multiply_and_sum(a,b) }"},
+    {"id":"hnsw","path":"src/hnsw.rs","content":"pub struct HnswIndex { graph: Vec<Node> } // approximate nearest neighbor vector search with ef_search"},
+    {"id":"bm25","path":"src/bm25.rs","content":"pub struct Bm25Index { postings: HashMap<String, Vec<DocId>> } // lexical ranking and exact term retrieval"},
+    {"id":"watch","path":"src/watch.rs","content":"pub fn watch_files() { debounce_events(); update_changed_files(); } // incremental file indexing"},
+    {"id":"graph","path":"src/graph.rs","content":"pub fn callers(symbol: SymbolId) -> Vec<SymbolId> { reverse_call_edges(symbol) } // code relationship graph"},
+    {"id":"pdf","path":"src/pdf.rs","content":"pub fn extract_pdf_text(bytes: &[u8]) -> Vec<Paragraph> { parse_document_streams(bytes) }"},
+    {"id":"audio","path":"src/audio.rs","content":"pub fn read_id3_tags(bytes: &[u8]) -> TrackMetadata { parse_artist_album_title(bytes) }"},
+    {"id":"search-guide","path":"docs/search.md","content":"Approximate nearest neighbor retrieval locates similar high dimensional vectors using a navigable graph. Lexical search retrieves exact names."},
+    {"id":"index-guide","path":"docs/indexing.md","content":"Incremental indexing watches files and refreshes changed content while preserving query visibility after updates."},
+    {"id":"graph-guide","path":"docs/graph.md","content":"A dependency graph connects functions and files. Reverse edges show which callers may be affected by a change."},
+    {"id":"pdf-guide","path":"docs/documents.md","content":"Document extraction divides PDF text into paragraphs so a question can find the passage containing its answer."},
+    {"id":"firmware-a","path":"artifacts/a.bin","content":"Binary File a firmware bytes","fingerprint_byte":42},
+    {"id":"firmware-b","path":"artifacts/b.bin","content":"Binary File b firmware bytes","fingerprint_byte":42}
+  ],
+  "queries": [
+    {"id":"e1","kind":"exact","text":"cosine_similarity","relevance":{"simd-cosine":3}},
+    {"id":"e2","kind":"exact","text":"dot_product","relevance":{"simd-dot":3,"simd-cosine":1}},
+    {"id":"e3","kind":"exact","text":"HnswIndex","relevance":{"hnsw":3}},
+    {"id":"e4","kind":"exact","text":"Bm25Index","relevance":{"bm25":3}},
+    {"id":"e5","kind":"exact","text":"watch_files","relevance":{"watch":3}},
+    {"id":"e6","kind":"exact","text":"read_id3_tags","relevance":{"audio":3}},
+    {"id":"s1","kind":"semantic","text":"how do I find similar vectors efficiently","relevance":{"search-guide":3,"hnsw":2}},
+    {"id":"s2","kind":"semantic","text":"which code responds to saved file changes","relevance":{"watch":3,"index-guide":2}},
+    {"id":"s3","kind":"semantic","text":"find the passage answering a question in a paper","relevance":{"pdf-guide":3,"pdf":2}},
+    {"id":"s4","kind":"semantic","text":"what functions could break if this one changes","relevance":{"graph-guide":3,"graph":2}},
+    {"id":"s5","kind":"semantic","text":"read musician and album details from an audio file","relevance":{"audio":3}},
+    {"id":"s6","kind":"semantic","text":"rank documents by matching their precise words","relevance":{"bm25":3,"search-guide":2}}
+  ]
+}

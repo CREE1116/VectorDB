@@ -1,0 +1,25 @@
+[package]
+name = "vectordb-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vectordb"
+path = "src/main.rs"
+
+[dependencies]
+vectordb-core = { path = "../vectordb-core" }
+vectordb-parser = { path = "../vectordb-parser" }
+vectordb-server = { path = "../vectordb-server" }
+tokio.workspace = true
+clap.workspace = true
+colored.workspace = true
+indicatif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+walkdir.workspace = true

@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="ko" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VectorDB - Hybrid Vector & Code Graph Engine</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#eef2ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca', 900: '#312e81' },
+            darkbg: '#0f172a',
+            darkcard: '#1e293b',
+            darkborder: '#334155'
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    #graph-network {
+      width: 100%;
+      height: 480px;
+      background: #0f172a;
+      border-radius: 0.75rem;
+    }
+    pre code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85rem;
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #1e293b; }
+    ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-darkbg text-slate-100 min-h-screen flex flex-col font-sans">
+
+  <!-- Header -->
+  <header class="border-b border-darkborder bg-darkcard/80 backdrop-blur sticky top-0 z-50 px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+    <div class="flex items-center space-x-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-cyan-400 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/30">
+        VDB
+      </div>
+      <div>
+        <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+          VectorDB <span class="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Hybrid Vector & Graph</span>
+        </h1>
+        <p class="text-xs text-slate-400">High-Performance SIMD HNSW & AST Code Knowledge Retrieval</p>
+      </div>
+    </div>
+
+    <!-- Live Stats Badges -->
+    <div id="stats-bar" class="flex items-center gap-3 text-xs">
+      <div class="px-3 py-1.5 rounded-lg bg-slate-800/80 border border-darkborder flex items-center gap-1.5">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span class="text-slate-400">Vectors:</span>
+        <span id="stat-vectors" class="font-semibold text-white">0</span>
+      </div>
+      <div class="px-3 py-1.5 rounded-lg bg-slate-800/80 border border-darkborder flex items-center gap-1.5">
+        <span class="text-slate-400">Chunks:</span>
+        <span id="stat-chunks" class="font-semibold text-white">0</span>
+      </div>
+      <div class="px-3 py-1.5 rounded-lg bg-slate-800/80 border border-darkborder flex items-center gap-1.5">
+        <span class="text-slate-400">Graph Nodes:</span>
+        <span id="stat-nodes" class="font-semibold text-white">0</span>
+      </div>
+      <div class="px-3 py-1.5 rounded-lg bg-slate-800/80 border border-darkborder flex items-center gap-1.5">
+        <span class="text-slate-400">Edges:</span>
+        <span id="stat-edges" class="font-semibold text-white">0</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="flex-1 p-6 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+    <!-- Left Column: Search & Controls (5 cols) -->
+    <section class="lg:col-span-5 flex flex-col gap-6">
+
+      <!-- Query Box -->
+      <div class="bg-darkcard border border-darkborder rounded-xl p-5 shadow-sm">
+        <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">하이브리드 시맨틱 & 코드 검색</label>
+        <div class="relative">
+          <input id="query-input" type="text"
+            placeholder="예: 벡터 거리 계산, cosine similarity, fn search..."
+            class="w-full bg-slate-900 border border-darkborder rounded-lg pl-4 pr-24 py-3 text-sm focus:outline-none focus:border-indigo-500 text-white placeholder-slate-500"
+            onkeydown="if(event.key==='Enter') executeSearch()"
+          />
+          <button onclick="executeSearch()"
+            class="absolute right-2 top-2 bottom-2 px-4 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-md transition shadow-md shadow-indigo-600/20">
+            검색
+          </button>
+        </div>
+
+        <div class="mt-3 flex items-center justify-between text-xs text-slate-400">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input id="chk-graph-expand" type="checkbox" checked class="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0">
+            <span>그래프 의존성 확장 (k-hop)</span>
+          </label>
+          <div class="flex items-center gap-2">
+            <span>Limit:</span>
+            <select id="sel-limit" class="bg-slate-900 border border-darkborder rounded px-2 py-1 text-xs text-slate-300">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Search Results List -->
+      <div class="bg-darkcard border border-darkborder rounded-xl p-5 flex-1 flex flex-col min-h-[400px]">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">검색 결과 (<span id="results-count">0</span>)</h2>
+          <button id="btn-copy-llm" onclick="copyLlmPrompt()" class="hidden text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 font-medium">
+            📋 LLM 프롬프트 복사
+          </button>
+        </div>
+        <div id="results-container" class="flex-1 overflow-y-auto space-y-3 max-h-[580px] pr-1">
+          <div class="text-center py-16 text-slate-500 text-sm">
+            상단 검색창에 쿼리를 입력하거나 디렉토리를 인덱싱하세요.
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick Indexing Form -->
+      <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+        <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">로컬 디렉토리 인덱싱</label>
+        <div class="flex gap-2">
+          <input id="index-path-input" type="text" value="./crates" placeholder="./src 또는 /path/to/project"
+            class="flex-1 bg-slate-900 border border-darkborder rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-indigo-500 text-white" />
+          <button onclick="triggerIndex()" id="btn-index"
+            class="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-darkborder text-xs rounded-lg font-medium transition">
+            인덱싱 시작
+          </button>
+        </div>
+        <p id="index-status" class="text-[11px] text-slate-500 mt-2"></p>
+      </div>
+
+    </section>
+
+    <!-- Right Column: Graph Visualizer & Inspector (7 cols) -->
+    <section class="lg:col-span-7 flex flex-col gap-6">
+
+      <!-- Interactive Knowledge Graph Viewer -->
+      <div class="bg-darkcard border border-darkborder rounded-xl p-5 shadow-sm">
+        <div class="flex items-center justify-between mb-3">
+          <div class="flex items-center gap-2">
+            <span class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">코드 & 지식 구조 그래프 (Interactive Graph)</h2>
+          </div>
+          <div class="text-[11px] text-slate-400 flex items-center gap-3">
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-indigo-400"></span> 함수/메서드</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-amber-400"></span> 구조체/클래스</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-400"></span> 파일</span>
+          </div>
+        </div>
+        <div id="graph-network" class="border border-darkborder"></div>
+      </div>
+
+      <!-- Code Chunk & Details Inspector -->
+      <div class="bg-darkcard border border-darkborder rounded-xl p-5 flex-1 flex flex-col min-h-[350px]">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">
+            <span id="inspector-badge" class="text-[11px] px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono">Select a chunk or node</span>
+            <span id="inspector-file" class="text-xs text-slate-400 font-mono"></span>
+          </div>
+          <span id="inspector-lines" class="text-xs text-slate-500"></span>
+        </div>
+        <div id="inspector-content" class="flex-1 bg-slate-950 border border-darkborder rounded-lg p-4 overflow-x-auto text-xs text-slate-300 leading-relaxed max-h-[360px]">
+          <span class="text-slate-500">좌측 검색 결과나 상단 그래프 노드를 클릭하면 해당 코드 청크 및 연관 심볼이 이곳에 표시됩니다.</span>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <script>
+    let network = null;
+    let currentLlmPrompt = "";
+
+    async function loadStats() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        document.getElementById('stat-vectors').innerText = data.total_vectors.toLocaleString();
+        document.getElementById('stat-chunks').innerText = data.total_chunks.toLocaleString();
+        document.getElementById('stat-nodes').innerText = data.total_nodes.toLocaleString();
+        document.getElementById('stat-edges').innerText = data.total_edges.toLocaleString();
+      } catch (e) {
+        console.error("Stats load failed", e);
+      }
+    }
+
+    async function loadFullGraph() {
+      try {
+        const res = await fetch('/api/graph');
+        const data = await res.json();
+        renderGraph(data.nodes, data.edges);
+      } catch (e) {
+        console.error("Graph load failed", e);
+      }
+    }
+
+    function renderGraph(nodesData, edgesData) {
+      const container = document.getElementById('graph-network');
+
+      const colorMap = {
+        'Function': { background: '#6366f1', border: '#4338ca' },
+        'Method': { background: '#818cf8', border: '#4f46e5' },
+        'Struct': { background: '#f59e0b', border: '#d97706' },
+        'Class': { background: '#f59e0b', border: '#d97706' },
+        'File': { background: '#10b981', border: '#059669' },
+        'DocSection': { background: '#06b6d4', border: '#0891b2' },
+        'Module': { background: '#ec4899', border: '#db2777' },
+      };
+
+      const nodes = new vis.DataSet(
+        nodesData.slice(0, 150).map(n => {
+          const colors = colorMap[n.kind] || { background: '#64748b', border: '#475569' };
+          return {
+            id: n.id,
+            label: n.label,
+            shape: n.kind === 'File' ? 'box' : 'dot',
+            size: n.kind === 'File' ? 20 : 12,
+            color: {
+              background: colors.background,
+              border: colors.border,
+              highlight: { background: '#38bdf8', border: '#0284c7' }
+            },
+            font: { color: '#f8fafc', size: 11, face: 'monospace' },
+            data: n
+          };
+        })
+      );
+
+      const edges = new vis.DataSet(
+        edgesData.slice(0, 300).map((e, idx) => ({
+          id: 'e_' + idx,
+          from: e.source,
+          to: e.target,
+          arrows: 'to',
+          color: { color: '#475569', highlight: '#38bdf8' },
+          label: e.kind,
+          font: { color: '#64748b', size: 9, align: 'middle' },
+          smooth: { type: 'continuous' }
+        }))
+      );
+
+      const options = {
+        physics: {
+          stabilization: false,
+          barnesHut: { gravitationalConstant: -1500, springLength: 60 }
+        },
+        interaction: { hover: true, tooltipDelay: 100 }
+      };
+
+      if (network) network.destroy();
+      network = new vis.Network(container, { nodes, edges }, options);
+
+      network.on("click", function(params) {
+        if (params.nodes.length > 0) {
+          const selectedId = params.nodes[0];
+          const nodeObj = nodes.get(selectedId);
+          if (nodeObj && nodeObj.data) {
+            inspectNode(nodeObj.data);
+          }
+        }
+      });
+    }
+
+    async function inspectNode(node) {
+      document.getElementById('inspector-badge').innerText = node.kind + ': ' + node.label;
+      document.getElementById('inspector-file').innerText = node.file_path;
+      document.getElementById('inspector-lines').innerText = `L${node.start_line} - L${node.end_line}`;
+
+      if (node.chunk_id) {
+        try {
+          const res = await fetch('/api/chunk/' + encodeURIComponent(node.chunk_id));
+          const chunk = await res.json();
+          document.getElementById('inspector-content').innerHTML = `<pre><code>${escapeHtml(chunk.content)}</code></pre>`;
+        } catch (e) {
+          document.getElementById('inspector-content').innerText = node.signature || node.label;
+        }
+      } else {
+        document.getElementById('inspector-content').innerText = node.signature || (node.label + " (" + node.kind + ")");
+      }
+    }
+
+    async function executeSearch() {
+      const query = document.getElementById('query-input').value.trim();
+      if (!query) return;
+
+      const limit = parseInt(document.getElementById('sel-limit').value);
+      const expand = document.getElementById('chk-graph-expand').checked ? 1 : 0;
+
+      const container = document.getElementById('results-container');
+      container.innerHTML = '<div class="text-center py-10 text-slate-400">Searching...</div>';
+
+      try {
+        const res = await fetch('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, limit, expand_graph: expand })
+        });
+        const data = await res.json();
+
+        document.getElementById('results-count').innerText = data.hits.length;
+        document.getElementById('btn-copy-llm').classList.remove('hidden');
+
+        // Fetch formatted LLM prompt
+        const llmRes = await fetch('/api/llm-context?q=' + encodeURIComponent(query));
+        currentLlmPrompt = await llmRes.text();
+
+        if (data.hits.length === 0) {
+          container.innerHTML = '<div class="text-center py-10 text-slate-500">일치하는 결과가 없습니다.</div>';
+          return;
+        }
+
+        container.innerHTML = data.hits.map((hit, idx) => `
+          <div onclick="inspectHit(${idx})" class="p-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-darkborder/70 hover:border-indigo-500/50 cursor-pointer transition">
+            <div class="flex items-center justify-between mb-1.5">
+              <span class="text-xs font-semibold text-indigo-300 font-mono truncate max-w-[200px]">
+                ${hit.node ? hit.node.label : hit.chunk.file_path}
+              </span>
+              <span class="text-[11px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono">
+                ${(hit.score * 100).toFixed(1)}% match
+              </span>
+            </div>
+            <div class="text-[11px] text-slate-400 truncate mb-1">
+              <code>${hit.chunk.file_path}:${hit.chunk.start_line}</code>
+            </div>
+            <div class="text-xs text-slate-400 line-clamp-2 font-mono bg-slate-950/60 p-1.5 rounded border border-darkborder/30">
+              ${escapeHtml(hit.chunk.content.slice(0, 140))}...
+            </div>
+          </div>
+        `).join('');
+
+        window._lastHits = data.hits;
+        if (data.hits.length > 0) {
+          inspectHit(0);
+        }
+
+        // If subgraph returned, render it
+        if (data.subgraph && data.subgraph.nodes.length > 0) {
+          renderGraph(data.subgraph.nodes, data.subgraph.edges);
+        }
+
+      } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-xs">검색 중 오류 발생: ${e.message}</div>`;
+      }
+    }
+
+    function inspectHit(idx) {
+      if (!window._lastHits || !window._lastHits[idx]) return;
+      const hit = window._lastHits[idx];
+      document.getElementById('inspector-badge').innerText = (hit.node ? hit.node.kind + ': ' + hit.node.label : 'Chunk');
+      document.getElementById('inspector-file').innerText = hit.chunk.file_path;
+      document.getElementById('inspector-lines').innerText = `L${hit.chunk.start_line} - L${hit.chunk.end_line}`;
+      document.getElementById('inspector-content').innerHTML = `<pre><code>${escapeHtml(hit.chunk.content)}</code></pre>`;
+    }
+
+    async function triggerIndex() {
+      const path = document.getElementById('index-path-input').value.trim();
+      const statusEl = document.getElementById('index-status');
+      const btn = document.getElementById('btn-index');
+
+      btn.disabled = true;
+      btn.innerText = "인덱싱 중...";
+      statusEl.innerText = "파일을 분석하고 HNSW 벡터 및 그래프를 구성하는 중...";
+
+      try {
+        const res = await fetch('/api/index', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path })
+        });
+        const data = await res.json();
+        statusEl.innerText = `완료! 파일 ${data.files_indexed}개, 청크 ${data.chunks_indexed}개, 그래프 노드 ${data.nodes_indexed}개 생성됨.`;
+        await loadStats();
+        await loadFullGraph();
+      } catch (e) {
+        statusEl.innerText = "오류: " + e.message;
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "인덱싱 시작";
+      }
+    }
+
+    function copyLlmPrompt() {
+      if (!currentLlmPrompt) return;
+      navigator.clipboard.writeText(currentLlmPrompt);
+      const btn = document.getElementById('btn-copy-llm');
+      const originalText = btn.innerText;
+      btn.innerText = "✅ 복사 완료!";
+      setTimeout(() => { btn.innerText = originalText; }, 2000);
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      loadStats();
+      loadFullGraph();
+    });
+  </script>
+</body>
+</html>
