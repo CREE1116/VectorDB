@@ -4,6 +4,32 @@ VectorDB는 로컬 파일과 코드에서 **작업에 관련된 위치를 찾는
 
 > 현재는 품질과 규모를 검증하는 단계입니다. 기본 벡터는 신경망 임베딩이 아니라 토큰·문자 n-gram 해시입니다. 측정값과 미검증 범위는 [REPORT.md](REPORT.md), [VALIDATION.md](VALIDATION.md)에 있습니다.
 
+## 어떻게 작동하나요?
+
+```mermaid
+flowchart LR
+    Files["로컬 코드·문서·바이너리"] --> Parser["파일 파싱·청크 생성"]
+    Parser --> BM25["BM25 텍스트 인덱스"]
+    Parser --> Features["해시 벡터·바이트 fingerprint"]
+    Parser --> Graph["코드 구조 그래프"]
+    Features --> Text["텍스트 HNSW"]
+    Features --> Code["코드 HNSW"]
+    Features --> Binary["바이너리 HNSW"]
+    BM25 --> Snapshot[".vectordb/metadata.bin"]
+    Text --> Snapshot
+    Code --> Snapshot
+    Binary --> Snapshot
+    Graph --> Snapshot
+    Agent["Codex · Claude Code · Antigravity · OpenCode"] --> Skill["프로젝트 스킬"]
+    Skill --> CLI["vectordb CLI"]
+    Hook["선택적 프롬프트 훅"] -.-> CLI
+    CLI --> Snapshot
+    CLI --> Leads["관련 경로 · 줄 번호 · 청크"]
+    Leads --> Verify["에이전트가 현재 파일 확인"]
+```
+
+색인은 로컬 스냅샷으로 저장됩니다. 에이전트 스킬은 필요할 때 CLI를 호출하고, Codex·Claude Code의 선택적 훅은 프롬프트마다 짧은 경로 힌트를 제공합니다. 훅이 파일을 색인하거나 에이전트 대신 코드를 수정하지는 않습니다.
+
 ## 빠른 시작
 
 Rust 도구 모음을 설치한 뒤 이 저장소에서 CLI를 빌드합니다.
@@ -58,6 +84,28 @@ python3 integrations/install.py "$PROJECT"
 에이전트에게 다음처럼 요청할 수 있습니다.
 
 > VectorDB 스킬로 로그인 만료 처리 코드를 찾아줘. 관련 경로와 줄 번호를 알려주고, 실제 파일을 확인한 다음 수정해줘.
+
+### 실사용 시나리오 1: 버그 수정 위치 찾기
+
+예를 들어 다른 저장소에서 “토큰 갱신 후에도 로그인이 풀린다”는 이슈를 받았다면:
+
+1. 프로젝트에서 `vectordb index .`를 한 번 실행하고 위 설치기로 스킬을 넣습니다.
+2. 에이전트에게 **“VectorDB로 토큰 갱신·세션 만료 코드를 찾아 관련 파일을 확인해줘”**라고 요청합니다.
+3. 에이전트는 `search`로 후보 경로를 받고, `find`로 관련 심볼을 좁힌 뒤, 현재 파일을 열어 실제 구현을 확인합니다. 수정 영향이 궁금하면 `impact`를 조회합니다.
+4. 에이전트가 코드를 바꾼 뒤에는 `vectordb index .`를 다시 실행하거나 `watch`가 변경을 저장할 때까지 기다린 다음 검색 결과를 재확인합니다.
+
+이 순서는 인덱스를 **탐색 출발점**으로 쓰는 예입니다. 검색 점수만으로 버그 위치나 수정의 안전성이 확정되지는 않습니다.
+
+### 실사용 시나리오 2: 작업 중 계속 바뀌는 저장소
+
+첫 색인을 만든 뒤 별도 터미널에서 감시를 켭니다.
+
+```bash
+cd "$PROJECT"
+vectordb watch . --debounce-ms 300
+```
+
+에이전트가 파일을 저장하면 감시기가 파일 시스템 이벤트를 묶어 바뀐 경로를 다시 색인합니다. 다음 검색은 저장된 새 스냅샷을 읽습니다. 감시 시작 전에 첫 색인을 수행해야 하며, 대규모 저장소에서는 변경 시 HNSW 재구축과 전체 스냅샷 쓰기 비용이 발생합니다.
 
 ### 선택 사항: 프롬프트 훅
 
