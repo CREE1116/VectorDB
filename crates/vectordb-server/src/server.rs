@@ -193,9 +193,7 @@ async fn index_directory(
             if node.is_some() {
                 nodes_count += 1;
             }
-            state
-                .engine
-                .add_chunk_and_node(chunk, node, file.custom_vector.clone());
+            state.engine.add_chunk_and_node(chunk, node, None);
             chunks_count += 1;
         }
 
