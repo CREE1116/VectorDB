@@ -793,6 +793,24 @@ impl VectorDBEngine {
         self.graph.read().all_nodes().cloned().collect()
     }
 
+    pub fn indexed_file_paths(&self) -> Vec<String> {
+        let mut paths: Vec<_> = self
+            .store
+            .read()
+            .all_chunks()
+            .map(|chunk| chunk.file_path.clone())
+            .collect();
+        paths.extend(
+            self.graph
+                .read()
+                .all_nodes()
+                .map(|node| node.file_path.clone()),
+        );
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     pub fn get_all_edges(&self) -> Vec<Edge> {
         self.graph.read().all_edges().into_iter().cloned().collect()
     }

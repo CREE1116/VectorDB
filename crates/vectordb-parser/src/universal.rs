@@ -14,6 +14,102 @@ pub enum FileCategory {
 
 pub struct UniversalFileAdapter;
 
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| from + offset)
+}
+
+fn find_pdf_operator(bytes: &[u8], operator: &[u8], from: usize) -> Option<usize> {
+    let mut position = from;
+    while let Some(found) = find_bytes(bytes, operator, position) {
+        let before = found == 0 || bytes[found - 1].is_ascii_whitespace();
+        let after = found + operator.len() == bytes.len()
+            || bytes[found + operator.len()].is_ascii_whitespace();
+        if before && after {
+            return Some(found);
+        }
+        position = found + operator.len();
+    }
+    None
+}
+
+fn pdf_literal_strings(text_object: &[u8]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut array_strings = Vec::new();
+    let mut in_array = false;
+    let mut i = 0;
+    while i < text_object.len() {
+        match text_object[i] {
+            b'[' => {
+                in_array = true;
+                array_strings.clear();
+                i += 1;
+            }
+            b']' if in_array => {
+                let mut next = i + 1;
+                while next < text_object.len() && text_object[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if text_object.get(next..next + 2) == Some(b"TJ") {
+                    result.append(&mut array_strings);
+                }
+                in_array = false;
+                i += 1;
+            }
+            b'(' => {
+                let mut depth = 1;
+                let mut next = i + 1;
+                let mut literal = Vec::new();
+                while next < text_object.len() && depth > 0 {
+                    let byte = text_object[next];
+                    if byte == b'\\' && next + 1 < text_object.len() {
+                        literal.push(text_object[next + 1]);
+                        next += 2;
+                        continue;
+                    }
+                    if byte == b'(' {
+                        depth += 1;
+                    } else if byte == b')' {
+                        depth -= 1;
+                    }
+                    if depth > 0 {
+                        literal.push(byte);
+                    }
+                    next += 1;
+                }
+                if depth == 0 {
+                    if let Ok(text) = std::str::from_utf8(&literal) {
+                        let text = text.trim();
+                        if text.len() >= 3 && text.chars().any(char::is_alphabetic) {
+                            if in_array {
+                                array_strings.push(text.to_string());
+                            } else {
+                                let mut operator = next;
+                                while operator < text_object.len()
+                                    && text_object[operator].is_ascii_whitespace()
+                                {
+                                    operator += 1;
+                                }
+                                if text_object.get(operator..operator + 2) == Some(b"Tj")
+                                    || text_object.get(operator) == Some(&b'\'')
+                                {
+                                    result.push(text.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+    result
+}
+
 impl UniversalFileAdapter {
     pub fn is_excluded_extension(ext: &str) -> bool {
         matches!(
@@ -87,52 +183,39 @@ impl UniversalFileAdapter {
     pub fn parse_pdf(bytes: &[u8], rel_path: &str) -> ParsedFile {
         let file_node_id = format!("pdf:{}", rel_path);
         let mut extracted_texts = Vec::new();
-
-        // 1. Resilient text extraction from PDF stream objects
-        let mut i = 0;
         let mut current_buf = Vec::new();
-        while i < bytes.len() {
-            // Find literal strings in parenthesis `(...)`
-            if bytes[i] == b'(' {
-                let mut depth = 1;
-                let mut j = i + 1;
-                let mut text_bytes = Vec::new();
-                while j < bytes.len() && depth > 0 {
-                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                        text_bytes.push(bytes[j + 1]);
-                        j += 2;
-                        continue;
-                    }
-                    if bytes[j] == b'(' {
-                        depth += 1;
-                    } else if bytes[j] == b')' {
-                        depth -= 1;
-                    }
-
-                    if depth > 0 {
-                        text_bytes.push(bytes[j]);
-                    }
-                    j += 1;
-                }
-
-                if let Ok(s) = std::str::from_utf8(&text_bytes) {
-                    let clean = s.trim();
-                    if clean.len() >= 3 && clean.chars().any(|c| c.is_alphabetic()) {
-                        current_buf.push(clean.to_string());
-                        let current_chars: usize = current_buf.iter().map(|s| s.len()).sum();
-                        if current_chars >= 800 {
-                            extracted_texts.push(current_buf.join(" "));
-                            current_buf.clear();
-                            if extracted_texts.len() >= 50 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                i = j;
-                continue;
+        let mut cursor = 0;
+        while let Some(stream_start) = find_bytes(bytes, b"stream", cursor) {
+            let mut data_start = stream_start + b"stream".len();
+            if bytes.get(data_start) == Some(&b'\r') {
+                data_start += 1;
             }
-            i += 1;
+            if bytes.get(data_start) == Some(&b'\n') {
+                data_start += 1;
+            }
+            let Some(stream_end) = find_bytes(bytes, b"endstream", data_start) else {
+                break;
+            };
+            let stream = &bytes[data_start..stream_end];
+            let mut text_cursor = 0;
+            while let Some(begin) = find_pdf_operator(stream, b"BT", text_cursor) {
+                let Some(end) = find_pdf_operator(stream, b"ET", begin + 2) else {
+                    break;
+                };
+                for text in pdf_literal_strings(&stream[begin + 2..end]) {
+                    current_buf.push(text);
+                    let current_chars: usize = current_buf.iter().map(String::len).sum();
+                    if current_chars >= 800 {
+                        extracted_texts.push(current_buf.join(" "));
+                        current_buf.clear();
+                    }
+                }
+                text_cursor = end + 2;
+            }
+            cursor = stream_end + b"endstream".len();
+            if extracted_texts.len() >= 50 {
+                break;
+            }
         }
 
         if !current_buf.is_empty() && extracted_texts.len() < 50 {
@@ -211,5 +294,18 @@ impl UniversalFileAdapter {
             nodes,
             edges,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_only_text_showing_pdf_literals() {
+        let source = b"%PDF-1.4\n/Title (metadata only)\nstream\nBT (Visible heading) Tj [(Split) -20 (paragraph)] TJ ET\nendstream";
+        let parsed = UniversalFileAdapter::parse_pdf(source, "paper.pdf");
+        assert_eq!(parsed.chunks.len(), 1);
+        assert_eq!(parsed.chunks[0].content, "Visible heading Split paragraph");
     }
 }

@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -21,6 +21,7 @@ const UI_HTML: &str = include_str!("ui.html");
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<VectorDBEngine>,
+    pub db_dir: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -60,12 +61,17 @@ pub struct LlmQuery {
 
 pub struct VectorDBServer {
     engine: Arc<VectorDBEngine>,
+    db_dir: PathBuf,
     port: u16,
 }
 
 impl VectorDBServer {
-    pub fn new(engine: Arc<VectorDBEngine>, port: u16) -> Self {
-        Self { engine, port }
+    pub fn new(engine: Arc<VectorDBEngine>, db_dir: PathBuf, port: u16) -> Self {
+        Self {
+            engine,
+            db_dir,
+            port,
+        }
     }
 
     pub fn router(state: AppState) -> Router {
@@ -89,6 +95,7 @@ impl VectorDBServer {
     pub async fn run(&self) -> anyhow::Result<()> {
         let state = AppState {
             engine: self.engine.clone(),
+            db_dir: self.db_dir.clone(),
         };
 
         let app = Self::router(state);
@@ -148,10 +155,10 @@ async fn index_directory(
     Json(payload): Json<IndexRequest>,
 ) -> Result<Json<IndexResponse>, (StatusCode, String)> {
     let base_path = Path::new(&payload.path);
-    if !base_path.exists() {
+    if !base_path.is_dir() {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("Path does not exist: {}", payload.path),
+            format!("Index path is not a directory: {}", payload.path),
         ));
     }
 
@@ -162,16 +169,18 @@ async fn index_directory(
             format!("Failed to parse directory: {}", e),
         )
     })?;
+    let files_count = parsed_files.len();
 
     let mut chunks_count = 0;
     let mut nodes_count = 0;
     let mut edges_count = 0;
     let mut pending_edges = Vec::new();
 
+    let existing_paths = state.engine.indexed_file_paths();
     state.engine.remove_files_batch(
-        &parsed_files
+        &existing_paths
             .iter()
-            .map(|file| file.file_path.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>(),
     );
 
@@ -207,8 +216,15 @@ async fn index_directory(
             as usize;
     }
 
+    state.engine.save_to_dir(&state.db_dir).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save index: {error}"),
+        )
+    })?;
+
     Ok(Json(IndexResponse {
-        files_indexed: 1,
+        files_indexed: files_count,
         chunks_indexed: chunks_count,
         nodes_indexed: nodes_count,
         edges_indexed: edges_count,
@@ -219,4 +235,54 @@ async fn get_llm_context(Query(query): Query<LlmQuery>, State(state): State<AppS
     let limit = query.limit.unwrap_or(5);
     let search_res = state.engine.search(&query.q, limit, 1);
     state.engine.package_for_llm(&search_res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn api_reindex_persists_text_only_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "vectordb-api-reindex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let corpus = root.join("corpus");
+        let db_dir = root.join("db");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let note = corpus.join("notes.txt");
+        std::fs::write(&note, "persistent API evidence").unwrap();
+        let state = AppState {
+            engine: Arc::new(VectorDBEngine::new(256)),
+            db_dir: db_dir.clone(),
+        };
+        let payload = || IndexRequest {
+            path: corpus.to_string_lossy().into_owned(),
+        };
+        let first = index_directory(State(state.clone()), Json(payload()))
+            .await
+            .unwrap();
+        assert_eq!(first.files_indexed, 1);
+        assert_eq!(
+            VectorDBEngine::load_from_dir(&db_dir, 256)
+                .unwrap()
+                .indexed_file_paths(),
+            vec!["notes.txt"]
+        );
+
+        std::fs::write(&note, b"\x89PNG\r\n\x1a\n\0binary").unwrap();
+        let second = index_directory(State(state), Json(payload()))
+            .await
+            .unwrap();
+        assert_eq!(second.files_indexed, 0);
+        assert!(VectorDBEngine::load_from_dir(&db_dir, 256)
+            .unwrap()
+            .indexed_file_paths()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

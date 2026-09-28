@@ -28,7 +28,7 @@ Apple M4 Pro, release 빌드, 합성 텍스트 청크 N개, 각 규모별 5회, 
 
 명령: `cargo run --release -p vectordb-cli -- benchmark benchmarks/retrieval-smoke.json`
 
-14개 혼합 문서(코드 8, 문서 4, 바이너리 2), 수작업 라벨 12문항(정확한 이름 6, 의미 설명 6)의 작은 기능 점검이다. 아래 수치는 이 fixture에만 해당하며 제품 품질이나 통계적 우위를 뜻하지 않는다.
+14개 텍스트 청크(코드 예제와 문서), 수작업 라벨 12문항(정확한 이름 6, 의미 설명 6)의 작은 기능 점검이다. 오디오·바이너리를 다루는 코드 예제가 포함되어 있지만 비텍스트 파일을 색인하는 실험은 아니다. 아래 수치는 이 fixture에만 해당하며 제품 품질이나 통계적 우위를 뜻하지 않는다.
 
 | 질문 유형 | 검색 | Hit@1 | Recall@5 | MRR | nDCG@10 |
 |---|---|---:|---:|---:|---:|
@@ -38,6 +38,8 @@ Apple M4 Pro, release 빌드, 합성 텍스트 청크 N개, 각 규모별 5회, 
 | 의미 설명 | BM25 | 0.667 | 0.500 | 0.700 | 0.611 |
 | 의미 설명 | Dense | 0.333 | 0.250 | 0.431 | 0.514 |
 | 의미 설명 | Hybrid | 0.500 | 0.583 | 0.672 | 0.664 |
+
+2026-09-28에 현재 브랜치의 fixture를 다시 실행해 같은 값을 확인했다. 의미 설명 질문에서 Hybrid는 BM25보다 Recall@5가 높지만 Hit@1과 MRR은 낮다. 현재 해시 벡터 결합이 검색 품질을 일관되게 높인다는 증거는 없다.
 
 ## HNSW와 전수 SIMD 검색
 
@@ -57,7 +59,7 @@ Apple M4 Pro, macOS 27.2, release 빌드. 고정 시드 `8044120188428062263`으
 
 ## 일관성과 그래프
 
-`cargo test incremental_matches_fresh_after_ten_thousand_mutations -- --ignored`는 여섯 텍스트 경로에 10,000번의 create/edit, delete, rename/move, copy를 적용하고 100회마다 새 인덱스와 비교한다. 저장·재로딩도 1,000회마다 확인한다. 이 검사는 통과했다. 실제 파일 감시, Git branch 전환, 대형 코퍼스, 교차 파일 그래프, 충돌·강제 종료 일관성은 아직 검증하지 않았다.
+`cargo test incremental_matches_fresh_after_ten_thousand_mutations -- --ignored`는 여섯 텍스트 경로에 10,000번의 create/edit, delete, rename/move, copy를 적용하고 100회마다 새 인덱스와 비교한다. 저장·재로딩도 1,000회마다 확인한다. 이 검사는 통과했다. 2026-09-28에는 실제 감시 프로세스에서 텍스트→바이너리→텍스트 전환과 검색 반영을 확인했다. Git branch 전환, 대형 코퍼스, 교차 파일 그래프, 충돌·강제 종료 일관성은 아직 검증하지 않았다.
 
 스냅샷 저장은 임시 파일을 기록·동기화한 뒤 `metadata.bin`으로 교체한다. 이는 부분 파일을 기존 스냅샷 위에 직접 쓰던 문제를 줄이지만, 강제 종료 fault injection을 통과했다는 뜻은 아니다.
 

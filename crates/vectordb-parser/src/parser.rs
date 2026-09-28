@@ -1207,7 +1207,12 @@ mod tests {
         std::fs::write(dir.join("scan.pdf"), b"%PDF-1.4\n/image only").unwrap();
         std::fs::write(
             dir.join("paper.pdf"),
-            b"%PDF-1.4\n(Extracted PDF paragraph)",
+            b"%PDF-1.4\nstream\nBT (Extracted PDF paragraph) Tj ET\nendstream",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("metadata.pdf"),
+            b"%PDF-1.4\n1 0 obj << /Title (Metadata only title) >> endobj",
         )
         .unwrap();
 
@@ -1220,6 +1225,9 @@ mod tests {
             .is_err());
         assert!(parser
             .parse_file(&dir.join("scan.pdf"), "scan.pdf")
+            .is_err());
+        assert!(parser
+            .parse_file(&dir.join("metadata.pdf"), "metadata.pdf")
             .is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

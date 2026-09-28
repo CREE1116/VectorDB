@@ -150,7 +150,7 @@ enum Commands {
         path: PathBuf,
 
         /// Debounce interval in milliseconds
-        #[arg(short, long, default_value_t = 300)]
+        #[arg(short = 'b', long, default_value_t = 300)]
         debounce_ms: u64,
     },
 
@@ -225,11 +225,18 @@ fn load_or_create_engine(db_dir: &Path) -> anyhow::Result<VectorDBEngine> {
 }
 
 fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        target_dir.is_dir(),
+        "Index path is not a directory: {}",
+        target_dir.display()
+    );
     println!("{}", "🚀 Scanning and parsing codebase...".bold().cyan());
 
     let parser = CodeParser::new();
     let parsed_files = parser.scan_directory(target_dir)?;
-    let engine = load_or_create_engine(db_dir)?;
+    // `index` is a full snapshot of this directory. Starting fresh also removes
+    // files that disappeared or stopped being readable text since the last run.
+    let engine = VectorDBEngine::new(EMBED_DIM);
 
     if parsed_files.is_empty() {
         println!(
@@ -245,13 +252,6 @@ fn handle_index(db_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({msg})")?
             .progress_chars("#>-"),
-    );
-
-    engine.remove_files_batch(
-        &parsed_files
-            .iter()
-            .map(|file| file.file_path.as_str())
-            .collect::<Vec<_>>(),
     );
 
     let mut total_chunks = 0;
@@ -526,7 +526,7 @@ async fn handle_serve(db_dir: &Path, port: u16, open: bool) -> anyhow::Result<()
         let _ = open_browser(&format!("http://localhost:{}", port));
     }
 
-    let server = VectorDBServer::new(engine, port);
+    let server = VectorDBServer::new(engine, db_dir.to_path_buf(), port);
     server.run().await?;
     Ok(())
 }
@@ -1041,4 +1041,68 @@ async fn handle_watch(db_dir: &Path, target_dir: &Path, debounce_ms: u64) -> any
         }
     }
     anyhow::bail!("filesystem watcher stopped")
+}
+
+#[cfg(test)]
+mod text_index_tests {
+    use super::*;
+
+    #[test]
+    fn watch_options_parse_without_short_flag_collision() {
+        let parsed = Cli::try_parse_from([
+            "vectordb",
+            "--db-dir",
+            "/tmp/example-db",
+            "watch",
+            "/tmp/example-source",
+            "-b",
+            "100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Watch {
+                debounce_ms: 100,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn full_reindex_removes_files_that_become_non_text() {
+        let root = std::env::temp_dir().join(format!(
+            "vectordb-cli-text-reindex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let corpus = root.join("corpus");
+        let db_dir = root.join("db");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("notes.txt"), "unique reindex evidence").unwrap();
+        std::fs::write(
+            corpus.join("metadata.pdf"),
+            b"%PDF-1.4\n1 0 obj << /Title (metadata evidence) >> endobj",
+        )
+        .unwrap();
+        handle_index(&db_dir, &corpus).unwrap();
+        let loaded = VectorDBEngine::load_from_dir(&db_dir, EMBED_DIM).unwrap();
+        assert_eq!(loaded.indexed_file_paths(), vec!["notes.txt"]);
+
+        assert!(handle_index(&db_dir, &root.join("missing")).is_err());
+        let loaded = VectorDBEngine::load_from_dir(&db_dir, EMBED_DIM).unwrap();
+        assert_eq!(loaded.indexed_file_paths(), vec!["notes.txt"]);
+
+        std::fs::write(corpus.join("notes.txt"), b"\x89PNG\r\n\x1a\n\0binary").unwrap();
+        handle_index(&db_dir, &corpus).unwrap();
+        let loaded = VectorDBEngine::load_from_dir(&db_dir, EMBED_DIM).unwrap();
+        assert!(loaded.indexed_file_paths().is_empty());
+        assert!(loaded
+            .search("unique reindex evidence", 5, 0)
+            .hits
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
