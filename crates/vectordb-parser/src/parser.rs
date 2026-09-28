@@ -906,122 +906,195 @@ impl CodeParser {
         nodes: &mut Vec<Node>,
         edges: &mut Vec<Edge>,
     ) {
-        let lines: Vec<&str> = content.lines().collect();
-        let header_regex = Regex::new(r"^(#{1,6})\s+(.*)").unwrap();
-
-        let mut current_section_start = 0;
-        let mut current_title = "Introduction".to_string();
-        let mut last_chunk_id: Option<String> = None;
-
-        for i in 0..lines.len() {
-            if let Some(caps) = header_regex.captures(lines[i]) {
-                if i > current_section_start {
-                    let section_lines = &lines[current_section_start..i];
-                    let section_content = section_lines.join("\n").trim().to_string();
-                    if !section_content.is_empty() {
-                        let start_line = current_section_start + 1;
-                        let end_line = i;
-                        let chunk_id = format!("chunk:{}:{}:{}", rel_path, start_line, end_line);
-                        let node_id = format!("doc:{}:{}", rel_path, current_title);
-
-                        let node = Node {
-                            id: node_id.clone(),
-                            label: current_title.clone(),
-                            kind: NodeKind::DocSection,
-                            file_path: rel_path.to_string(),
-                            start_line,
-                            end_line,
-                            signature: None,
-                            docstring: None,
-                            chunk_id: Some(chunk_id.clone()),
-                            vector_id: None,
-                            metadata: HashMap::new(),
-                        };
-
-                        let chunk = Chunk {
-                            id: chunk_id.clone(),
-                            file_path: rel_path.to_string(),
-                            start_line,
-                            end_line,
-                            tokens_approx: section_content.split_whitespace().count(),
-                            content: section_content,
-                            summary: None,
-                            node_id: Some(node_id.clone()),
-                            vector_id: 0,
-                        };
-
-                        edges.push(Edge {
-                            source: file_node_id.to_string(),
-                            target: node_id.clone(),
-                            kind: EdgeKind::Contains,
-                            weight: 1.0,
-                        });
-
-                        if let Some(prev) = last_chunk_id {
-                            edges.push(Edge {
-                                source: prev,
-                                target: chunk_id.clone(),
-                                kind: EdgeKind::NextChunk,
-                                weight: 0.5,
-                            });
-                        }
-                        last_chunk_id = Some(chunk_id.clone());
-
-                        nodes.push(node);
-                        chunks.push(chunk);
-                    }
-                }
-                current_section_start = i;
-                current_title = caps[2].trim().to_string();
-            }
+        struct Section {
+            start: usize,
+            end: usize,
+            title: String,
+            content: String,
+            node_id: String,
         }
 
-        // Final section
-        if current_section_start < lines.len() {
-            let section_lines = &lines[current_section_start..lines.len()];
-            let section_content = section_lines.join("\n").trim().to_string();
-            if !section_content.is_empty() {
-                let start_line = current_section_start + 1;
-                let end_line = lines.len();
-                let chunk_id = format!("chunk:{}:{}:{}", rel_path, start_line, end_line);
-                let node_id = format!("doc:{}:{}", rel_path, current_title);
-
-                let node = Node {
-                    id: node_id.clone(),
-                    label: current_title.clone(),
-                    kind: NodeKind::DocSection,
-                    file_path: rel_path.to_string(),
-                    start_line,
-                    end_line,
-                    signature: None,
-                    docstring: None,
-                    chunk_id: Some(chunk_id.clone()),
-                    vector_id: None,
-                    metadata: HashMap::new(),
-                };
-
-                let chunk = Chunk {
-                    id: chunk_id.clone(),
-                    file_path: rel_path.to_string(),
-                    start_line,
-                    end_line,
-                    tokens_approx: section_content.split_whitespace().count(),
-                    content: section_content,
-                    summary: None,
-                    node_id: Some(node_id.clone()),
-                    vector_id: 0,
-                };
-
-                edges.push(Edge {
-                    source: file_node_id.to_string(),
-                    target: node_id.clone(),
-                    kind: EdgeKind::Contains,
-                    weight: 1.0,
-                });
-
-                nodes.push(node);
-                chunks.push(chunk);
+        let lines: Vec<&str> = content.lines().collect();
+        let header_regex = Regex::new(r"^(#{1,6})\s+(.*)").unwrap();
+        let anchor_regex = Regex::new(r"(!?)\[[^\]\n]+\]\(#([^\s)]+)\)").unwrap();
+        let fence_marker = |line: &str| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                Some('`')
+            } else if trimmed.starts_with("~~~") {
+                Some('~')
+            } else {
+                None
             }
+        };
+        let slug = |title: &str| {
+            let mut value = String::new();
+            for character in title.to_lowercase().chars() {
+                if character.is_alphanumeric() || character == '_' || character == '-' {
+                    value.push(character);
+                } else if character.is_whitespace() && !value.ends_with('-') {
+                    value.push('-');
+                }
+            }
+            value.trim_matches('-').to_string()
+        };
+
+        let mut spans = Vec::new();
+        let mut start = 0;
+        let mut title = "Introduction".to_string();
+        let mut fence = None;
+        for (index, line) in lines.iter().enumerate() {
+            if let Some(marker) = fence_marker(line) {
+                if fence == Some(marker) {
+                    fence = None;
+                } else if fence.is_none() {
+                    fence = Some(marker);
+                }
+                continue;
+            }
+            if fence.is_some() {
+                continue;
+            }
+            if let Some(captures) = header_regex.captures(line) {
+                if index > start {
+                    spans.push((start, index, title));
+                }
+                start = index;
+                title = captures[2].trim().to_string();
+            }
+        }
+        if start < lines.len() {
+            spans.push((start, lines.len(), title));
+        }
+
+        let mut sections = Vec::new();
+        let mut anchors = HashMap::new();
+        let mut anchor_counts = HashMap::<String, usize>::new();
+        for (start, end, title) in spans {
+            let text = lines[start..end].join("\n").trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            let node_id = format!("doc:{}:L{}", rel_path, start + 1);
+            if header_regex.is_match(lines[start]) {
+                let base = slug(&title);
+                if !base.is_empty() {
+                    let count = anchor_counts.entry(base.clone()).or_insert(0);
+                    let anchor = if *count == 0 {
+                        base
+                    } else {
+                        format!("{}-{}", base, count)
+                    };
+                    anchors.insert(anchor, node_id.clone());
+                    *count += 1;
+                }
+            }
+            sections.push(Section {
+                start,
+                end,
+                title,
+                content: text,
+                node_id,
+            });
+        }
+
+        let mut previous_node_id = None;
+        for section in sections {
+            let start_line = section.start + 1;
+            let chunk_id = format!("chunk:{}:{}:{}", rel_path, start_line, section.end);
+            let mut link_evidence = Vec::new();
+            let mut link_fence = None;
+            for (offset, line) in lines[section.start..section.end].iter().enumerate() {
+                if let Some(marker) = fence_marker(line) {
+                    if link_fence == Some(marker) {
+                        link_fence = None;
+                    } else if link_fence.is_none() {
+                        link_fence = Some(marker);
+                    }
+                    continue;
+                }
+                if link_fence.is_some() {
+                    continue;
+                }
+                let mut visible = String::with_capacity(line.len());
+                let mut inline_code = false;
+                for character in line.chars() {
+                    if character == '`' {
+                        inline_code = !inline_code;
+                        visible.push(' ');
+                    } else if inline_code {
+                        visible.push(' ');
+                    } else {
+                        visible.push(character);
+                    }
+                }
+                for captures in anchor_regex.captures_iter(&visible) {
+                    let full = captures.get(0).unwrap();
+                    if &captures[1] == "!"
+                        || (full.start() > 0 && visible.as_bytes()[full.start() - 1] == b'\\')
+                    {
+                        continue;
+                    }
+                    let anchor = captures[2].to_lowercase();
+                    if let Some(target_id) = anchors.get(&anchor) {
+                        if *target_id != section.node_id {
+                            edges.push(Edge {
+                                source: section.node_id.clone(),
+                                target: target_id.clone(),
+                                kind: EdgeKind::LinksTo,
+                                weight: 1.0,
+                            });
+                            link_evidence.push((start_line + offset, anchor, target_id.clone()));
+                        }
+                    }
+                }
+            }
+            let mut metadata = HashMap::new();
+            if !link_evidence.is_empty() {
+                metadata.insert(
+                    "markdown_links".to_string(),
+                    serde_json::to_string(&link_evidence).unwrap(),
+                );
+            }
+            nodes.push(Node {
+                id: section.node_id.clone(),
+                label: section.title,
+                kind: NodeKind::DocSection,
+                file_path: rel_path.to_string(),
+                start_line,
+                end_line: section.end,
+                signature: None,
+                docstring: None,
+                chunk_id: Some(chunk_id.clone()),
+                vector_id: None,
+                metadata,
+            });
+            chunks.push(Chunk {
+                id: chunk_id.clone(),
+                file_path: rel_path.to_string(),
+                start_line,
+                end_line: section.end,
+                tokens_approx: section.content.split_whitespace().count(),
+                content: section.content,
+                summary: None,
+                node_id: Some(section.node_id.clone()),
+                vector_id: 0,
+            });
+            edges.push(Edge {
+                source: file_node_id.to_string(),
+                target: section.node_id.clone(),
+                kind: EdgeKind::Contains,
+                weight: 1.0,
+            });
+            if let Some(previous) = previous_node_id {
+                edges.push(Edge {
+                    source: previous,
+                    target: section.node_id.clone(),
+                    kind: EdgeKind::NextChunk,
+                    weight: 0.5,
+                });
+            }
+            previous_node_id = Some(section.node_id);
         }
     }
 
@@ -1207,7 +1280,12 @@ mod tests {
         std::fs::write(dir.join("scan.pdf"), b"%PDF-1.4\n/image only").unwrap();
         std::fs::write(
             dir.join("paper.pdf"),
-            b"%PDF-1.4\n(Extracted PDF paragraph)",
+            b"%PDF-1.4\nstream\nBT (Extracted PDF paragraph) Tj ET\nendstream",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("metadata.pdf"),
+            b"%PDF-1.4\n1 0 obj << /Title (Metadata only title) >> endobj",
         )
         .unwrap();
 
@@ -1221,6 +1299,43 @@ mod tests {
         assert!(parser
             .parse_file(&dir.join("scan.pdf"), "scan.pdf")
             .is_err());
+        assert!(parser
+            .parse_file(&dir.join("metadata.pdf"), "metadata.pdf")
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_markdown_headings_keep_distinct_units_and_local_links() {
+        let dir =
+            std::env::temp_dir().join(format!("vectordb-markdown-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let document = "# Index\n[First](#overview)\n[Second](#overview-1)\n![image](#overview)\n`[inline](#overview)`\n```md\n[code](#overview)\n```\n## Overview\nFirst body\n## Overview\nSecond body\n";
+        std::fs::write(dir.join("notes.md"), document).unwrap();
+        let parsed = CodeParser::new()
+            .parse_file(&dir.join("notes.md"), "notes.md")
+            .unwrap();
+        let sections: Vec<_> = parsed
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::DocSection)
+            .collect();
+        assert_eq!(sections.len(), 3);
+        let ids: HashSet<_> = sections.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        let links: Vec<_> = parsed
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::LinksTo)
+            .collect();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].source, sections[0].id);
+        assert_eq!(links[0].target, sections[1].id);
+        assert_eq!(links[1].source, sections[0].id);
+        assert_eq!(links[1].target, sections[2].id);
+        let evidence = &sections[0].metadata["markdown_links"];
+        assert!(evidence.contains("[2,\"overview\""));
+        assert!(evidence.contains("[3,\"overview-1\""));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

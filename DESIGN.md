@@ -50,6 +50,6 @@ Topic modeling should operate on substantive units such as sections or paragraph
 
 ## Current state and next proof
 
-Today, Markdown sections and code symbols are represented as graph nodes with containment and some structural edges. Cross-file call-shaped matches are `CallsCandidate`; Git co-change is recorded separately. Document concepts, citations, paragraph-level identity, and topic nodes are not yet extracted. The present feature embedder is lexical hashing, so topic modeling with meaningful semantic embeddings requires a separate experiment.
+Today, Markdown sections and code symbols are represented as graph nodes with containment and some structural edges. Local Markdown anchor links connect distinct section units as `LinksTo`, with source lines recorded on the source node. Cross-file call-shaped matches are `CallsCandidate`; Git co-change is recorded separately. Cross-document links, document concepts, citations, paragraph-level identity, and topic nodes are not yet extracted. The present feature embedder is lexical hashing, so topic modeling with meaningful semantic embeddings requires a separate experiment.
 
 The next evaluation needs labeled links between units in the same document and across documents, plus queries where graph expansion might help. Measure edge precision by relation kind, retrieval Recall@K/MRR/nDCG, mutation invalidation, index size, and cold query latency. Add a derived relation to the default path only when it improves a stated task without burying exact evidence.
