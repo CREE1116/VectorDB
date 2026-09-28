@@ -1,4 +1,4 @@
-//! VectorDB CLI: Hybrid Vector & Code Graph Engine.
+//! VectorDB CLI: text retrieval and semantic unit graph.
 //! LLM Agent-friendly and human-friendly interface.
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -21,7 +21,7 @@ const EMBED_DIM: usize = 256;
 
 #[derive(Parser)]
 #[command(name = "vectordb")]
-#[command(about = "Fast, SIMD-accelerated Hybrid Vector & Code Graph Engine", long_about = None)]
+#[command(about = "Local text retrieval and semantic unit graph", long_about = None)]
 #[command(version)]
 struct Cli {
     #[arg(short, long, global = true, default_value = DEFAULT_DB_DIR)]
@@ -56,7 +56,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 5)]
         limit: usize,
 
-        /// Graph hop expansion depth (0 = pure vector search, 1+ = include called functions/types)
+        /// Graph hop expansion depth (0 = retrieval only, 1+ = include linked units)
         #[arg(short, long, default_value_t = 1)]
         expand_graph: usize,
 
@@ -100,13 +100,13 @@ enum Commands {
         id: String,
     },
 
-    /// Inspect a symbol node and its relationships in the knowledge graph
+    /// Inspect a document or code node and its relationships in the graph
     Graph {
         /// Node ID (e.g. symbol:crates/vectordb-core/src/hnsw.rs:HnswIndex)
         node_id: String,
 
         /// Traversal hops
-        #[arg(short, long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1)]
         hops: usize,
     },
 
@@ -133,7 +133,7 @@ enum Commands {
         symbol: String,
 
         /// Maximum call depth
-        #[arg(short, long, default_value_t = 2)]
+        #[arg(long, default_value_t = 2)]
         depth: usize,
     },
 
@@ -1048,24 +1048,17 @@ mod text_index_tests {
     use super::*;
 
     #[test]
-    fn watch_options_parse_without_short_flag_collision() {
-        let parsed = Cli::try_parse_from([
-            "vectordb",
-            "--db-dir",
-            "/tmp/example-db",
-            "watch",
-            "/tmp/example-source",
-            "-b",
-            "100",
-        ])
-        .unwrap();
-        assert!(matches!(
-            parsed.command,
-            Commands::Watch {
-                debounce_ms: 100,
-                ..
-            }
-        ));
+    fn main_commands_parse_without_flag_collisions() {
+        for args in [
+            vec!["vectordb", "search", "example"],
+            vec!["vectordb", "graph", "doc:notes.md:L1", "--hops", "1"],
+            vec!["vectordb", "impact", "symbol", "--depth", "2"],
+            vec!["vectordb", "watch", "/tmp/example", "-b", "100"],
+            vec!["vectordb", "serve", "--port", "8080"],
+            vec!["vectordb", "co-change", "notes.md"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
     }
 
     #[test]
@@ -1103,6 +1096,46 @@ mod text_index_tests {
             .search("unique reindex evidence", 5, 0)
             .hits
             .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_markdown_links_survive_snapshot_and_reindex() {
+        let root = std::env::temp_dir().join(format!(
+            "vectordb-cli-markdown-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let corpus = root.join("corpus");
+        let db_dir = root.join("db");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let note = corpus.join("notes.md");
+        std::fs::write(
+            &note,
+            "# Start\n[Details](#details)\n## Details\nEvidence\n",
+        )
+        .unwrap();
+        handle_index(&db_dir, &corpus).unwrap();
+        let loaded = VectorDBEngine::load_from_dir(&db_dir, EMBED_DIM).unwrap();
+        assert_eq!(
+            loaded
+                .get_all_edges()
+                .iter()
+                .filter(|edge| edge.kind == vectordb_core::EdgeKind::LinksTo)
+                .count(),
+            1
+        );
+
+        std::fs::write(&note, "# Start\nNo link\n## Details\nEvidence\n").unwrap();
+        handle_index(&db_dir, &corpus).unwrap();
+        let loaded = VectorDBEngine::load_from_dir(&db_dir, EMBED_DIM).unwrap();
+        assert!(loaded
+            .get_all_edges()
+            .iter()
+            .all(|edge| edge.kind != vectordb_core::EdgeKind::LinksTo));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

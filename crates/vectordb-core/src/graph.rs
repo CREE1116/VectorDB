@@ -47,6 +47,8 @@ pub enum EdgeKind {
     CoChangedWith,
     /// Call-shaped text match without scope or import resolution.
     CallsCandidate,
+    /// Explicit local Markdown anchor link between document sections.
+    LinksTo,
 }
 
 impl std::fmt::Display for EdgeKind {
@@ -312,6 +314,7 @@ impl KnowledgeGraph {
         for edge in self.get_outgoing(node_id) {
             if (edge.kind == EdgeKind::Calls
                 || edge.kind == EdgeKind::References
+                || edge.kind == EdgeKind::LinksTo
                 || edge.kind == EdgeKind::Defines)
                 && seen.insert(edge.target.clone())
             {
